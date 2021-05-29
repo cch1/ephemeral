@@ -9,6 +9,11 @@
                            t1ms (+ t0ms delta)]
                        #?(:clj (java.util.Date. t1ms) :cljs (js/Date. t1ms))))
 
+(deftest create-satisfies
+  (let [eph (create)]
+    (is (satisfies? com.hapgood.ephemeral/IEphemeral eph))
+    (is (satisfies? com.hapgood.ephemeral/IPerishable eph))))
+
 (deftest uninitialized-ephemeral-cannot-be-captured
   (let [e (create)]
     (is (thrown? #?(:clj java.lang.IllegalStateException :cljs js/Error) (capture e)))))
