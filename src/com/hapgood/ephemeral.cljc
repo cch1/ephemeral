@@ -4,11 +4,11 @@
             [clojure.core.async :as async]
             [clojure.core.async.impl.protocols :as protocols]))
 
-(defprotocol Ephemeral
+(defprotocol IEphemeral
   (capture [ref] [ref fallback]  "Return the value of `ref` if available, otherwise return `fallback`")
   (available? [ref] "Return true if `ref` is available, otherwise false"))
 
-(defprotocol Perishable
+(defprotocol IPerishable
   (refresh! [ref v expires-at] "Refresh the container with the value `v` which will expire at the inst `expires-at`.")
   (expiry [ref] "Return the inst of expiration for the current value of `ref` or nil if it is already expired"))
 
@@ -22,8 +22,8 @@
 ;; defeats the ephemeral pattern.  Due to network and processing delays TOCTOU is a potential problem even
 ;; when not holding captured values.  Consider adding some margin to the expiry of ephemeral values (by
 ;; expiring them sooner) and/or conservatively refreshing them.
-(deftype RenewableEphemeral [pca source]
-  Ephemeral
+(deftype Ephemeral [pca source]
+  IEphemeral
   ;; This is the primary synchronous read interface.  Other sync reads should go through this method.
   (capture [this fallback] (or (some-> @pca async/poll! first) fallback))
   (capture [this] (let [v (capture this ::unavailable)]
@@ -32,7 +32,7 @@
                         (throw #?(:clj (java.lang.IllegalStateException. m) :cljs (js/Error. m)) ))
                       v)))
   (available? [this] (not= ::unavailable (capture this ::unavailable)))
-  Perishable
+  IPerishable
   (refresh! [this v expires-at] (async/put! source [v expires-at]))
   (expiry [this] (some-> @pca async/poll! second))
   protocols/ReadPort
@@ -65,7 +65,7 @@
                     (assert (async/offer! pc' ve))) ; Do this early to ensure no unecessary parking.
                   (reset! pca pc')
                   (recur pc')))))
-          (->RenewableEphemeral pca source)))
+          (->Ephemeral pca source)))
   ([] (create (async/promise-chan)))
   ([value expires-at] (let [pc (async/promise-chan)]
                         ;; pre-queue supplied [value, expires-at] tuple to allow synchronous create->capture
