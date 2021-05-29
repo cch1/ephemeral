@@ -6,3 +6,4 @@
 /.make.*
 /target
 /figwheel_server.log
+/cljs-test-runner-out
