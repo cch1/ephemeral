@@ -71,3 +71,22 @@
                         ;; pre-queue supplied [value, expires-at] tuple to allow synchronous create->capture
                         (when (pos? (delta-t (now) expires-at)) (async/offer! pc [value expires-at]))
                         (create pc))))
+
+#?(:clj
+   (do (defmethod clojure.core/print-method Ephemeral
+         [ephemeral ^java.io.Writer writer]
+         (.write writer (let [v (capture ephemeral ::unavailable)]
+                          (if (= v ::unavailable)
+                            "#<Ephemeral ?>"
+                            (str "#<Ephemeral " (pr-str v) ">")))))
+       (defmethod clojure.pprint/simple-dispatch Ephemeral
+         [ephemeral]
+         (print-method ephemeral *out*)))
+   :cljs
+   (extend-protocol IPrintWithWriter
+     Ephemeral
+     (-pr-writer [this writer opts]
+       (-write writer (let [v (capture this ::unavailable)]
+                        (if (= v ::unavailable)
+                          "#<Ephemeral ?>"
+                          (str "#<Ephemeral " (pr-str v) ">")))))))
