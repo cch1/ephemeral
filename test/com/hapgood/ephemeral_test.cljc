@@ -1,5 +1,6 @@
 (ns com.hapgood.ephemeral-test
   (:require [com.hapgood.ephemeral :as uat :refer [capture available? refresh! expiry create]]
+            [clojure.core.async :as async]
             [clojure.test :refer [deftest is testing #?(:cljs async)]])
   (:import #?(:clj (java.util Date))))
 
@@ -45,4 +46,11 @@
     #?@(:clj
         ((Thread/sleep 1) (is (= 1 (capture e))))
         :cljs
-        ((async done (js/setTimeout (fn [] (is (= 1 (capture e))) (done)) 10))))))
+        ((async done (js/setTimeout (fn [] (is (= 1 (capture e))) (done)) 1))))))
+
+(deftest initial-value-available-asynchronously
+  (let [e (create 0 (t+ (now) 1000))]
+    #?@(:clj
+        ((is (= 0 (async/<!! e))))
+        :cljs
+        ((async done (async/go (is (= 0 (async/<! e))) (done)))))))

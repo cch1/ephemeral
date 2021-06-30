@@ -2,7 +2,7 @@
   (:refer-clojure :exclude [ref])
   (:require [clojure.pprint :as pprint]
             [clojure.core.async :as async]
-            [clojure.core.async.impl.protocols :as protocols]))
+            [clojure.core.async.impl.protocols :as impl]))
 
 (defprotocol IEphemeral
   (capture [ref] [ref fallback]  "Return the value of `ref` if available, otherwise return `fallback`")
@@ -22,10 +22,10 @@
 ;; defeats the ephemeral pattern.  Due to network and processing delays TOCTOU is a potential problem even
 ;; when not holding captured values.  Consider adding some margin to the expiry of ephemeral values (by
 ;; expiring them sooner) and/or conservatively refreshing them.
-(deftype Ephemeral [pca source]
+(deftype Ephemeral [current source]
   IEphemeral
   ;; This is the primary synchronous read interface.  Other sync reads should go through this method.
-  (capture [this fallback] (or (some-> @pca async/poll! first) fallback))
+  (capture [this fallback] (or (-> current deref first async/poll!) fallback))
   (capture [this] (let [v (capture this ::unavailable)]
                     (if (= ::unavailable v)
                       (let [m "The ephemeral value is not available."]
@@ -34,13 +34,13 @@
   (available? [this] (not= ::unavailable (capture this ::unavailable)))
   IPerishable
   (refresh! [this v expires-at] (async/put! source [v expires-at]))
-  (expiry [this] (some-> @pca async/poll! second))
-  protocols/ReadPort
+  (expiry [this] (-> current deref second))
+  impl/ReadPort
   ;; This is the primary asynchronous read interface.
-  (take! [this fn-handler] (async/take! @pca fn-handler))
+  (take! [this fn-handler] (impl/take! (-> current deref first) fn-handler))
   #?@(:clj
       ;; The clojure.lang.IDeref 'protocol' is implemented since that is common practice for value containers.
-      (clojure.lang.IDeref (deref [this] (-> @pca async/<!! first)))
+      (clojure.lang.IDeref (deref [this] (-> current deref first async/<!!)))
       ;; The IDeref protocol is a semantic mismatch in ClojureScript since it assumes synchronous behavior.  We can't
       ;; offer synchronicity without some escape hatch (see `capture` above) so we don't implement IDeref in ClojureScript.
       #_ #_ :cljs (IDeref (-deref [this] (async/go ))))
@@ -49,28 +49,28 @@
                      (str "<Ephemeral: " v ">"))))
 
 (defn create
-  ([pc] (let [source (async/chan (async/sliding-buffer 1))
-              pca (atom pc)]
-          ;; coordinate the promise channel atom from [value, expires-at] tuples arriving on the source channel
-          (async/go-loop [pc pc]
-            (let [[_ expiry] (async/poll! pc)
-                  timeout (when expiry (async/timeout (delta-t (now) expiry)))
-                  cs (cond-> [source] timeout (conj timeout))
-                  [ve port] (async/alts! cs)]
-              (if (and (= source port) (not ve)) ; source closed
-                (async/close! pc) ; release any parked takes on undelivered promise channel and exit
-                (let [pc' (async/promise-chan)]
-                  (when ve ; we have a fresh value
-                    (assert (async/offer! pc ve)) ; Satisfy parked takes in case we were previously unavailable
-                    (assert (async/offer! pc' ve))) ; Do this early to ensure no unecessary parking.
-                  (reset! pca pc')
-                  (recur pc')))))
-          (->Ephemeral pca source)))
-  ([] (create (async/promise-chan)))
-  ([value expires-at] (let [pc (async/promise-chan)]
+  ([current] (let [source (async/chan (async/sliding-buffer 1))] ; sliding buffer keeps only the most recent when overloaded
+               ;; coordinate the current [promise-channel, expires-at] tuple from [value, expires-at] tuples arriving on the source channel
+               (async/go-loop [[pc expires-at] @current]
+                 (let [timeout (when-let [dt (and expires-at (delta-t (now) expires-at))]
+                                 (when (pos? dt) (async/timeout dt)))
+                       cs (cond-> [source] timeout (conj timeout))
+                       [[v' expires-at' :as ve] port] (async/alts! cs)]
+                   (if (and (= source port) (not ve)) ; source closed
+                     (async/close! pc) ; release any parked takes on undelivered promise channel and exit
+                     (let [pc' (async/promise-chan)]
+                       (when ve ; we have a fresh value (versus timed out)
+                         (assert (async/offer! pc v')) ; Satisfy parked takes in case we were previously unavailable
+                         (assert (async/offer! pc' v'))) ; Do this early to ensure no unecessary parking.
+                       (reset! current [pc' expires-at'])
+                       (recur [pc' expires-at'])))))
+               (->Ephemeral current source)))
+  ([] (create (atom [(async/promise-chan) nil])))
+  ([value expires-at] (let [pc (async/promise-chan)
+                            current (atom [pc expires-at])]
                         ;; pre-queue supplied [value, expires-at] tuple to allow synchronous create->capture
-                        (when (pos? (delta-t (now) expires-at)) (async/offer! pc [value expires-at]))
-                        (create pc))))
+                        (when (pos? (delta-t (now) expires-at)) (async/offer! pc value))
+                        (create current))))
 
 #?(:clj
    (do (defmethod clojure.core/print-method Ephemeral
