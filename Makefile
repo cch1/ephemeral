@@ -45,7 +45,13 @@ endif
 all: test $(pom-file) $(jar-file)
 
 .PHONY: test # Run the Clojure and ClojureScript test suites
-test: .make.test-clj .make.test-cljs
+test: test-clj test-cljs
+
+.PHONY: test-clj
+test-clj: .make.test-clj
+
+.PHONY: test-cljs
+test-cljs: .make.test-cljs
 
 .make.test-clj: deps.edn $(testfiles) $(srcfiles)
 	clojure -M:test:project/test-clj
