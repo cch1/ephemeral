@@ -34,23 +34,44 @@
 (deftest initial-value-expires
   (let [t (t+ (now) 50)
         e (create 72 t)]
-    #?@(:clj
-        ((Thread/sleep 100)
-         (is (thrown? java.lang.IllegalStateException (capture e))))
-        :cljs
-        ((async done (js/setTimeout (fn [] (is (thrown? js/Error (capture e))) (done)) 100))))))
+    #?(:clj
+       (do (Thread/sleep 100)
+           (is (thrown? java.lang.IllegalStateException (capture e))))
+       :cljs
+       (async done (js/setTimeout (fn [] (is (thrown? js/Error (capture e))) (done)) 100)))))
 
 (deftest value-can-be-refreshed
   (let [e (create 0 (t+ (now) 10))]
     (refresh! e 1 (t+ (now) 10))
-    #?@(:clj
-        ((Thread/sleep 1) (is (= 1 (capture e))))
-        :cljs
-        ((async done (js/setTimeout (fn [] (is (= 1 (capture e))) (done)) 1))))))
+    #?(:clj
+       (do (Thread/sleep 1)
+           (is (= 1 (capture e))))
+       :cljs
+       (async done (js/setTimeout (fn [] (is (= 1 (capture e))) (done)) 1)))))
 
 (deftest initial-value-available-asynchronously
   (let [e (create 0 (t+ (now) 1000))]
-    #?@(:clj
-        ((is (= 0 (async/<!! e))))
-        :cljs
-        ((async done (async/go (is (= 0 (async/<! e))) (done)))))))
+    #?(:clj
+       (is (= 0 (async/<!! e)))
+       :cljs
+       (async done (async/go (is (= 0 (async/<! e))) (done))))))
+
+(deftest pending-async-captures-are-satisfied-upon-refresh
+  (let [e (create)]
+    #?(:clj
+       (do (async/thread (Thread/sleep 10)
+                         (refresh! e 0 (t+ (now) 1000)))
+           (is (= 0 (async/<!! e))))
+       :cljs
+       (do (js/setTimeout (fn [] (refresh! e 0 (t+ (now) 1000))))
+           (async done (async/go (is (= 0 (async/<! e))) (done)))))))
+
+(deftest pending-async-captures-are-released-when-source-closes
+  (let [e (create)]
+    #?(:clj
+       (do (async/thread (Thread/sleep 10)
+                         (async/close! (.-source e)))
+           (is (nil? (async/<!! e))))
+       :cljs
+       (do (js/setTimeout (fn [] (async/close! (.-source e))) 10)
+           (async done (async/go (is (nil? (async/<! e))) (done)))))))
