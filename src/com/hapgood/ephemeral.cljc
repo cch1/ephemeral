@@ -45,8 +45,10 @@
       ;; offer synchronicity without some escape hatch (see `capture` above) so we don't implement IDeref in ClojureScript.
       )
   Object
-  (toString [this] (let [v (capture this (constantly "Not Available"))]
-                     (str "<Ephemeral: " v ">"))))
+  (toString [this] (let [v (capture this ::unavailable)]
+                     (if (= v ::unavailable)
+                       "#<Ephemeral >"
+                       (str "#<Ephemeral " (pr-str v) ">")))))
 
 (defn create
   ([current]
@@ -77,10 +79,7 @@
 #?(:clj
    (do (defmethod clojure.core/print-method Ephemeral
          [ephemeral ^java.io.Writer writer]
-         (.write writer (let [v (capture ephemeral ::unavailable)]
-                          (if (= v ::unavailable)
-                            "#<Ephemeral ?>"
-                            (str "#<Ephemeral " (pr-str v) ">")))))
+         (.write writer (.toString ephemeral)))
        (defmethod clojure.pprint/simple-dispatch Ephemeral
          [ephemeral]
          (print-method ephemeral *out*)))
@@ -88,7 +87,4 @@
    (extend-protocol IPrintWithWriter
      Ephemeral
      (-pr-writer [this writer opts]
-       (-write writer (let [v (capture this ::unavailable)]
-                        (if (= v ::unavailable)
-                          "#<Ephemeral ?>"
-                          (str "#<Ephemeral " (pr-str v) ">")))))))
+       (-write writer (.toString this)))))

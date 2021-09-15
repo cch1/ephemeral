@@ -75,3 +75,14 @@
        :cljs
        (do (js/setTimeout (fn [] (async/close! (.-source e))) 10)
            (async done (async/go (is (nil? (async/<! e))) (done)))))))
+
+(deftest string-representation
+  (let [e (create)]
+    ;; Use containing brackets to demarcate the psuedo-tag and value from surrounding context
+    ;; String must start with a `#` to prevent brackets from confusing some parsing (paredit? clojure-mode?)
+    (is (re-matches #"#<.+>" (str e)))))
+
+(deftest cannot-be-printed-as-data
+  ;; One should never expect Ephemeral references to be readable data.
+  #?(:clj (let [e (create)]
+            (is (thrown? java.lang.IllegalArgumentException (binding [*print-dup* true] (pr-str e)))))))
