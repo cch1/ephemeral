@@ -9,7 +9,8 @@
 
 (defprotocol IPerishable
   (refresh! [ref v expires-at] "Refresh the container with the value `v` which will expire at the inst `expires-at`.")
-  (expiry [ref] "Return the inst of expiration for the current value of `ref` or nil if it is already expired"))
+  (expiry [ref] "Return the inst of expiration for the current value of `ref` or nil if it is already expired")
+  (stop [ref] "Stop the pre-emptive update process for this `ref`."))
 
 (defn- now [] #?(:clj (java.util.Date.) :cljs (js/Date.)))
 
@@ -21,6 +22,7 @@
 ;; defeats the ephemeral pattern.  Due to network and processing delays TOCTOU is a potential problem even
 ;; when not holding captured values.  Consider adding some margin to the expiry of ephemeral values (by
 ;; expiring them sooner) and/or conservatively refreshing them.
+;; TODO: https://blog.klipse.tech/clojurescript/2016/04/26/deftype-explained.html
 (deftype Ephemeral [current source]
   IEphemeral
   ;; This is the primary synchronous read interface.  Other sync reads should go through this method.
@@ -34,6 +36,7 @@
   IPerishable
   (refresh! [this v expires-at] (async/put! source [v expires-at]))
   (expiry [this] (-> current deref second))
+  (stop [this] (async/close! source))
   impl/ReadPort
   ;; This is the primary asynchronous read interface.
   (take! [this fn-handler] (impl/take! (-> current deref first) fn-handler))
@@ -50,30 +53,55 @@
                        (str "#<Ephemeral " (pr-str v) ">")))))
 
 (defn create
-  ([current]
-   {:pre [(instance? #?(:cljs Atom :clj clojure.lang.Atom) current)]}
-   (let [source (async/chan (async/sliding-buffer 1))] ; sliding buffer keeps only the most recent when overloaded
-     ;; coordinate the current [promise-channel, expires-at] tuple from [value, expires-at] tuples arriving on the source channel
-     (async/go-loop [[pc expires-at] @current]
-       (let [timeout (when-let [dt (and expires-at (delta-t (now) expires-at))]
-                       (when (pos? dt) (async/timeout dt)))
-             cs (cond-> [source] timeout (conj timeout))
-             [[v' expires-at' :as ve] port] (async/alts! cs)]
-         (if (and (= source port) (not ve)) ; source closed
-           (async/close! pc) ; release any parked takes on undelivered promise channel and exit
-           (let [pc' (async/promise-chan)]
-             (when ve     ; we have a fresh value (versus timed out)
-               (assert (async/offer! pc v')) ; Satisfy parked takes in case we were previously unavailable
-               (assert (async/offer! pc' v'))) ; Do this early to ensure no unecessary parking.
-             (reset! current [pc' expires-at'])
-             (recur [pc' expires-at'])))))
-     (->Ephemeral current source)))
-  ([] (create (atom [(async/promise-chan) nil])))
-  ([value expires-at] (let [pc (async/promise-chan)
-                            current (atom [pc expires-at])]
-                        ;; pre-queue supplied [value, expires-at] tuple to allow synchronous create->capture
-                        (when (pos? (delta-t (now) expires-at)) (async/offer! pc value))
-                        (create current))))
+  "Create an ephemeral that can be supplied by the provided `acquire` function
+
+  The `acquire` function is passed a channel onto which it must place a tuple
+  of [`value` `expires-at`] where `expires-at` is the inst at which the ephemeral
+  `value` will expire."
+  [acquire]
+  {:pre [(fn? acquire)]}
+  (let [current (atom [(async/promise-chan) nil])
+        source (async/chan 1)]
+    ;; coordinate the current [promise-channel, expires-at] tuple from [value, expires-at] tuples arriving on the source channel
+    (async/go-loop [expiry nil alarm (async/timeout 0) called-at nil backoff 1]
+      (let [[event port] (async/alts! (filter identity [alarm source expiry]))
+            now (now)]
+        (if-let [[e a c b] (condp = port
+                             expiry (do (swap! current assoc-in [0] (async/promise-chan))
+                                        (tap> {::event {::type ::expiry}})
+                                        [nil alarm called-at backoff])
+                             alarm (do
+                                     (tap> {::event {::type ::alarm ::called-at now}})
+                                     (try (acquire source)
+                                          [expiry nil now 1]
+                                          (catch #?(:clj java.lang.Exception :cljs js/Error) _
+                                            (let [backoff (* 2 backoff)]
+                                              (tap> {::event {::type ::call-failed ::backoff backoff}})
+                                              [expiry (async/timeout backoff) now backoff]))))
+                             source (when-let [[v expires-at] event]
+                                      (let [latency (delta-t called-at now)
+                                            lifespan (delta-t now expires-at)
+                                            [[pc _] [pc' _]] (swap-vals! current (constantly [(async/promise-chan) expires-at]))]
+                                        (tap> {::event {::type ::source ::expires-at expires-at ::latency latency}})
+                                        (async/offer! pc v) ; release any previously blocked takes
+                                        (async/offer! pc' v)
+                                        [(async/timeout lifespan) (async/timeout (- lifespan latency)) called-at backoff])))]
+          (recur e a c b)
+          (do (swap! current (fn [[pc _]] (async/close! pc) [pc nil]))
+              (tap> {::event {::type ::shutdown}})))))
+    (->Ephemeral current source)))
+
+(defmacro stopping
+  "binding-pair => [name init]
+
+  Evaluates body in a try expression with name bound to the value
+  of the init, and a finally clause that calls (stop name)."
+  [binding-pair & body]
+  `(let ~binding-pair
+     (try
+       (do ~@body)
+       (finally
+         (stop ~(binding-pair 0))))))
 
 #?(:clj
    (do (defmethod clojure.core/print-method Ephemeral

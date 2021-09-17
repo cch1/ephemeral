@@ -1,7 +1,8 @@
 (ns com.hapgood.ephemeral-test
-  (:require [com.hapgood.ephemeral :as uat :refer [capture available? refresh! expiry create]]
+  (:require [com.hapgood.ephemeral :as uat :refer [capture available? refresh! expiry stopping stop create] :include-macros true]
             [clojure.core.async :as async]
-            [clojure.test :refer [deftest is testing #?(:cljs async)]])
+            [clojure.test :refer [deftest is testing #?(:cljs async)]]
+            [com.hapgood.test-utilities :refer [go-test] :include-macros true])
   (:import #?(:clj (java.util Date))))
 
 (defn- now [] #?(:clj (java.util.Date.) :cljs (js/Date.)))
@@ -10,79 +11,61 @@
                            t1ms (+ t0ms delta)]
                        #?(:clj (java.util.Date. t1ms) :cljs (js/Date. t1ms))))
 
+#_(add-tap (fn [{e ::uat/event}] (println e)))
+
+(defn- make-supplier
+  [n]
+  (let [state (atom -1)]
+    (fn [c]
+      (let [f (fn [] (async/put! c [(swap! state inc) (t+ (now) 1000)]))]
+        #?(:clj (do (Thread/sleep n) (f))
+           :cljs (js/setTimeout f n))))))
+
 (deftest create-satisfies
-  (let [eph (create)]
-    (is (satisfies? com.hapgood.ephemeral/IEphemeral eph))
-    (is (satisfies? com.hapgood.ephemeral/IPerishable eph))))
+  (stopping [eph (create (make-supplier 0))]
+            (is (satisfies? com.hapgood.ephemeral/IEphemeral eph))
+            (is (satisfies? com.hapgood.ephemeral/IPerishable eph))))
 
-(deftest uninitialized-ephemeral-cannot-be-captured
-  (let [e (create)]
-    (is (thrown? #?(:clj java.lang.IllegalStateException :cljs js/Error) (capture e)))))
+(deftest unavailable-ephemeral-cannot-be-captured
+  (go-test (stopping [e (create (make-supplier 1000))]
+                     (is (nil? (first (async/alts! [e (async/timeout 10)])))) ; timeout while waiting to read
+                     (is (thrown? #?(:clj java.lang.IllegalStateException :cljs js/Error) (capture e))))))
 
-(deftest initial-expired-value-cannot-be-captured-synchronously
-  ;; This test exposes unnecessary (and semantically broken) asynchronous expiring of initial values
-  (let [t #inst "1970-01-01T00:00:00.000-00:00"
-        e (create 72 t)]
-    (is (thrown? #?(:clj java.lang.IllegalStateException :cljs js/Error) (capture e)))))
+(deftest ephemeral-can-be-captured-once-supplied-with-value
+  (go-test (stopping [e (create (make-supplier 10))]
+                     (is (zero? (async/<! e))) ; rendez-vous
+                     (is (zero? (capture e))))))
 
-(deftest initial-value-synchronously-available
-  ;; This test exposes unnecessary (and semantically broken) asynchronous loading of initial values
-  (let [t #inst "2100-01-01T00:00:00.000-00:00"
-        e (create 72 t)]
-    (is (= 72 (capture e)))))
+(deftest supplied-values-expire
+  (go-test (stopping [e (create (let [state (atom -1)] ; only supply one value
+                                  (fn [c] (when (zero? (swap! state inc)) (async/put! c [@state (t+ (now) 100)])))))]
+                     (is (zero? (async/<! e))) ; rendez-vous
+                     (is (zero? (capture e)))
+                     (async/<! (async/timeout 110)) ; wait for the value to expire...
+                     (is (nil? (first (async/alts! [e (async/timeout 10)])))) ; timeout while waiting to read
+                     (is (thrown? #?(:clj java.lang.IllegalStateException :cljs js/Error) (capture e))))))
 
-(deftest initial-value-expires
-  (let [t (t+ (now) 50)
-        e (create 72 t)]
-    #?(:clj
-       (do (Thread/sleep 100)
-           (is (thrown? java.lang.IllegalStateException (capture e))))
-       :cljs
-       (async done (js/setTimeout (fn [] (is (thrown? js/Error (capture e))) (done)) 100)))))
-
-(deftest value-can-be-refreshed
-  (let [e (create 0 (t+ (now) 10))]
-    (refresh! e 1 (t+ (now) 10))
-    #?(:clj
-       (do (Thread/sleep 1)
-           (is (= 1 (capture e))))
-       :cljs
-       (async done (js/setTimeout (fn [] (is (= 1 (capture e))) (done)) 1)))))
-
-(deftest initial-value-available-asynchronously
-  (let [e (create 0 (t+ (now) 1000))]
-    #?(:clj
-       (is (= 0 (async/<!! e)))
-       :cljs
-       (async done (async/go (is (= 0 (async/<! e))) (done))))))
-
-(deftest pending-async-captures-are-satisfied-upon-refresh
-  (let [e (create)]
-    #?(:clj
-       (do (async/thread (Thread/sleep 10)
-                         (refresh! e 0 (t+ (now) 1000)))
-           (is (= 0 (async/<!! e))))
-       :cljs
-       (do (js/setTimeout (fn [] (refresh! e 0 (t+ (now) 1000))))
-           (async done (async/go (is (= 0 (async/<! e))) (done)))))))
+(deftest exceptions-supplying-value-are-caught-and-retried
+  (go-test (stopping [e (create (let [state (atom -5)] ; fail four times and then supply a value
+                                  (fn [c]
+                                    (if (neg? (swap! state inc))
+                                      (throw (ex-info "Boom" {}))
+                                      (async/put! c [@state (t+ (now) 100)])))))]
+                     (is (zero? (async/<! e)))  ; rendez-vous
+                     (is (zero? (capture e))))))
 
 (deftest pending-async-captures-are-released-when-source-closes
-  (let [e (create)]
-    #?(:clj
-       (do (async/thread (Thread/sleep 10)
-                         (async/close! (.-source e)))
-           (is (nil? (async/<!! e))))
-       :cljs
-       (do (js/setTimeout (fn [] (async/close! (.-source e))) 10)
-           (async done (async/go (is (nil? (async/<! e))) (done)))))))
+  (go-test (stopping [e (create async/close!)]
+                     (is (nil? (async/<! e))) ; NB: Failure to close promise channel will deadlock
+                     (is (thrown? #?(:clj java.lang.IllegalStateException :cljs js/Error) (capture e))))))
 
 (deftest string-representation
-  (let [e (create)]
-    ;; Use containing brackets to demarcate the psuedo-tag and value from surrounding context
-    ;; String must start with a `#` to prevent brackets from confusing some parsing (paredit? clojure-mode?)
-    (is (re-matches #"#<.+>" (str e)))))
+  (stopping [e (create (make-supplier 100))]
+            ;; Use containing brackets to demarcate the psuedo-tag and value from surrounding context
+            ;; String must start with a `#` to prevent brackets from confusing some parsing (paredit? clojure-mode?)
+            (is (re-matches #"#<.+>" (str e)))))
 
 (deftest cannot-be-printed-as-data
   ;; One should never expect Ephemeral references to be readable data.
-  #?(:clj (let [e (create)]
-            (is (thrown? java.lang.IllegalArgumentException (binding [*print-dup* true] (pr-str e)))))))
+  #?(:clj (stopping [e (create (make-supplier 100))]
+                    (is (thrown? java.lang.IllegalArgumentException (binding [*print-dup* true] (pr-str e)))))))
