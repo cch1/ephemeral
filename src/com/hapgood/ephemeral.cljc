@@ -1,5 +1,5 @@
 (ns com.hapgood.ephemeral
-  (:require [clojure.pprint :as pprint]
+  (:require [clojure.pprint]
             [clojure.core.async :as async]
             [clojure.core.async.impl.protocols :as impl]))
 
