@@ -1,5 +1,4 @@
 (ns com.hapgood.ephemeral
-  (:refer-clojure :exclude [ref])
   (:require [clojure.pprint :as pprint]
             [clojure.core.async :as async]
             [clojure.core.async.impl.protocols :as impl]))
