@@ -79,13 +79,17 @@
                                               (tap> {::event {::type ::call-failed ::backoff backoff}})
                                               [expiry (async/timeout backoff) now backoff]))))
                              source (when-let [[v expires-at] event]
-                                      (let [latency (delta-t called-at now)
-                                            lifespan (delta-t now expires-at)
-                                            [[pc _] [pc' _]] (swap-vals! current (constantly [(async/promise-chan) expires-at]))]
-                                        (tap> {::event {::type ::source ::expires-at expires-at ::latency latency}})
-                                        (async/offer! pc v) ; release any previously blocked takes
-                                        (async/offer! pc' v)
-                                        [(async/timeout lifespan) (async/timeout (- lifespan latency)) called-at backoff])))]
+                                      (if (seq event) ; Was a fresh value acquired?
+                                        (let [latency (delta-t called-at now)
+                                              lifespan (delta-t now expires-at)
+                                              [[pc _] [pc' _]] (swap-vals! current (constantly [(async/promise-chan) expires-at]))]
+                                          (tap> {::event {::type ::source ::expires-at expires-at ::latency latency}})
+                                          (async/offer! pc v) ; release any previously blocked takes
+                                          (async/offer! pc' v)
+                                          [(async/timeout lifespan) (async/timeout (- lifespan latency)) nil 1])
+                                        (let [backoff (* 2 backoff)]
+                                          (tap> {::event {::type ::source-failed}})
+                                          [expiry (async/timeout backoff) nil backoff]))))]
           (recur e a c b)
           (do (swap! current (fn [[pc _]] (async/close! pc) [pc nil]))
               (tap> {::event {::type ::shutdown}})))))

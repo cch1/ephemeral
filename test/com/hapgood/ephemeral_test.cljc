@@ -56,8 +56,16 @@
 
 (deftest pending-async-captures-are-released-when-source-closes
   (go-test (stopping [e (create async/close!)]
-                     (is (nil? (async/<! e))) ; NB: Failure to close promise channel will deadlock
+                     (is (nil? (async/<! e))) ; NB: Failure to close promise channel will deadlock this test
                      (is (thrown? #?(:clj java.lang.IllegalStateException :cljs js/Error) (capture e))))))
+
+(deftest acquire-fn-can-report-failure
+  (go-test (stopping [e (create (let [state (atom -5)]
+                                  (fn [c] (if (zero? (swap! state inc))
+                                            (async/put! c [@state (t+ (now) 1000)])
+                                            (async/put! c [])))))]
+                     (is (zero? (async/<! e)))
+                     (is (zero? (capture e))))))
 
 (deftest string-representation
   (stopping [e (create (make-supplier 100))]
