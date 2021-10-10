@@ -9,8 +9,7 @@
 
 (defprotocol IPerishable
   (refresh! [ref v expires-at] "Refresh the container with the value `v` which will expire at the inst `expires-at`.")
-  (expiry [ref] "Return the inst of expiration for the current value of `ref` or nil if it is already expired")
-  (stop [ref] "Stop the pre-emptive update process for this `ref`."))
+  (expiry [ref] "Return the inst of expiration for the current value of `ref` or nil if it is already expired"))
 
 (defn- now [] #?(:clj (java.util.Date.) :cljs (js/Date.)))
 
@@ -36,10 +35,12 @@
   IPerishable
   (refresh! [this v expires-at] (async/put! source [v expires-at]))
   (expiry [this] (-> current deref second))
-  (stop [this] (async/close! source))
   impl/ReadPort
   ;; This is the primary asynchronous read interface.
   (take! [this fn-handler] (impl/take! (-> current deref first) fn-handler))
+  impl/Channel
+  (close! [this] (impl/close! source))
+  (closed? [this] (impl/closed? source))
   #?@(:clj
       ;; The clojure.lang.IDeref 'protocol' is implemented since that is common practice for value containers.
       (clojure.lang.IDeref (deref [this] (-> current deref first async/<!!)))
@@ -105,7 +106,7 @@
      (try
        (do ~@body)
        (finally
-         (stop ~(binding-pair 0))))))
+         (async/close! ~(binding-pair 0))))))
 
 #?(:clj
    (do (defmethod clojure.core/print-method Ephemeral
