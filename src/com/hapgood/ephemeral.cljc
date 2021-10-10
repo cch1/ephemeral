@@ -31,8 +31,8 @@
 (defn create
   "Create an ephemeral that can be supplied by the provided `acquire` function
 
-  The `acquire` function is passed a channel onto which it must place a tuple
-  of [`value` `expires-at`] where `expires-at` is the inst at which the ephemeral
+  The `acquire` function is passed the channel-like ephemeral onto which it must place a
+  tuple of [`value` `expires-at`] where `expires-at` is the inst at which the ephemeral
   `value` will expire."
   [acquire]
   {:pre [(fn? acquire)]}
