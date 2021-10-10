@@ -22,7 +22,7 @@
   (put! [port val fn1-handler] (impl/put! source val fn1-handler))
   impl/Channel
   (close! [this] (impl/close! source))
-  (closed? [this] (impl/closed? source))
+  (closed? [this] (impl/closed? @current))
   Object
   (toString [this] (if-let [v (async/poll! this)]
                      (str "#<Ephemeral " (pr-str v) ">")
