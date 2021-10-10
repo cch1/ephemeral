@@ -17,7 +17,7 @@
 ;; TODO: https://blog.klipse.tech/clojurescript/2016/04/26/deftype-explained.html
 (deftype Ephemeral [current source]
   impl/ReadPort
-  (take! [this fn-handler] (impl/take! (-> current deref first) fn-handler))
+  (take! [this fn-handler] (impl/take! @current fn-handler))
   impl/Channel
   (close! [this] (impl/close! source))
   (closed? [this] (impl/closed? source))
@@ -34,14 +34,14 @@
   `value` will expire."
   [acquire]
   {:pre [(fn? acquire)]}
-  (let [current (atom [(async/promise-chan) nil])
+  (let [current (atom (async/promise-chan))
         source (async/chan 1)]
-    ;; coordinate the current [promise-channel, expires-at] tuple from [value, expires-at] tuples arriving on the source channel
+    ;; coordinate the current promise-channel from [value, expires-at] tuples arriving on the source channel
     (async/go-loop [expiry nil alarm (async/timeout 0) called-at nil backoff 1]
       (let [[event port] (async/alts! (filter identity [alarm source expiry]))
             now (now)]
         (if-let [[e a c b] (condp = port
-                             expiry (do (swap! current assoc-in [0] (async/promise-chan))
+                             expiry (do (reset! current (async/promise-chan))
                                         (tap> {::event {::type ::expiry}})
                                         [nil alarm called-at backoff])
                              alarm (do
@@ -56,7 +56,7 @@
                                       (if (seq event) ; Was a fresh value acquired?
                                         (let [latency (delta-t called-at now)
                                               lifespan (delta-t now expires-at)
-                                              [[pc _] [pc' _]] (swap-vals! current (constantly [(async/promise-chan) expires-at]))]
+                                              [pc pc'] (swap-vals! current (constantly (async/promise-chan)))]
                                           (tap> {::event {::type ::source ::expires-at expires-at ::latency latency}})
                                           (async/offer! pc v) ; release any previously blocked takes
                                           (async/offer! pc' v)
@@ -65,7 +65,7 @@
                                           (tap> {::event {::type ::source-failed}})
                                           [expiry (async/timeout backoff) nil backoff]))))]
           (recur e a c b)
-          (do (swap! current (fn [[pc _]] (async/close! pc) [pc nil]))
+          (do (swap! current (fn [pc] (async/close! pc) pc))
               (tap> {::event {::type ::shutdown}})))))
     (->Ephemeral current source)))
 
