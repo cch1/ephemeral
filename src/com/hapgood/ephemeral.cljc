@@ -3,55 +3,28 @@
             [clojure.core.async :as async]
             [clojure.core.async.impl.protocols :as impl]))
 
-(defprotocol IEphemeral
-  (capture [ref] [ref fallback]  "Return the value of `ref` if available, otherwise return `fallback`")
-  (available? [ref] "Return true if `ref` is available, otherwise false"))
-
-(defprotocol IPerishable
-  (refresh! [ref v expires-at] "Refresh the container with the value `v` which will expire at the inst `expires-at`.")
-  (expiry [ref] "Return the inst of expiration for the current value of `ref` or nil if it is already expired"))
-
 (defn- now [] #?(:clj (java.util.Date.) :cljs (js/Date.)))
 
 (defn- delta-t [t0 t1] (- (inst-ms t1) (inst-ms t0)))
 
-;; A reference type whose value may only be available transiently.  The referenced value can be captured
-;; when available but it may asynchronously become unavailable (and then available, and then ...).
+;; A channel-like type that coordinates the supply of fresh ephemeral values.
+;; Unlimited takes of a fresh value may be performed.  When the value expires, the ephemeral channel will block on takes.
+;; The ephemeral channel cycles between these two states based on the timely supply of fresh values.
 ;; NB: Avoid TOCTOU (time-of-check-time-of-use) race conditions by never holding a captured value -that
 ;; defeats the ephemeral pattern.  Due to network and processing delays TOCTOU is a potential problem even
 ;; when not holding captured values.  Consider adding some margin to the expiry of ephemeral values (by
 ;; expiring them sooner) and/or conservatively refreshing them.
 ;; TODO: https://blog.klipse.tech/clojurescript/2016/04/26/deftype-explained.html
 (deftype Ephemeral [current source]
-  IEphemeral
-  ;; This is the primary synchronous read interface.  Other sync reads should go through this method.
-  (capture [this fallback] (or (-> current deref first async/poll!) fallback))
-  (capture [this] (let [v (capture this ::unavailable)]
-                    (if (= ::unavailable v)
-                      (let [m "The ephemeral value is not available."]
-                        (throw #?(:clj (java.lang.IllegalStateException. m) :cljs (js/Error. m))))
-                      v)))
-  (available? [this] (not= ::unavailable (capture this ::unavailable)))
-  IPerishable
-  (refresh! [this v expires-at] (async/put! source [v expires-at]))
-  (expiry [this] (-> current deref second))
   impl/ReadPort
-  ;; This is the primary asynchronous read interface.
   (take! [this fn-handler] (impl/take! (-> current deref first) fn-handler))
   impl/Channel
   (close! [this] (impl/close! source))
   (closed? [this] (impl/closed? source))
-  #?@(:clj
-      ;; The clojure.lang.IDeref 'protocol' is implemented since that is common practice for value containers.
-      (clojure.lang.IDeref (deref [this] (-> current deref first async/<!!)))
-      ;; The IDeref protocol is a semantic mismatch in ClojureScript since it assumes synchronous behavior.  We can't
-      ;; offer synchronicity without some escape hatch (see `capture` above) so we don't implement IDeref in ClojureScript.
-      )
   Object
-  (toString [this] (let [v (capture this ::unavailable)]
-                     (if (= v ::unavailable)
-                       "#<Ephemeral >"
-                       (str "#<Ephemeral " (pr-str v) ">")))))
+  (toString [this] (if-let [v (async/poll! this)]
+                     (str "#<Ephemeral " (pr-str v) ">")
+                     "#<Ephemeral >")))
 
 (defn create
   "Create an ephemeral that can be supplied by the provided `acquire` function
@@ -95,18 +68,6 @@
           (do (swap! current (fn [[pc _]] (async/close! pc) [pc nil]))
               (tap> {::event {::type ::shutdown}})))))
     (->Ephemeral current source)))
-
-(defmacro stopping
-  "binding-pair => [name init]
-
-  Evaluates body in a try expression with name bound to the value
-  of the init, and a finally clause that calls (stop name)."
-  [binding-pair & body]
-  `(let ~binding-pair
-     (try
-       (do ~@body)
-       (finally
-         (async/close! ~(binding-pair 0))))))
 
 #?(:clj
    (do (defmethod clojure.core/print-method Ephemeral

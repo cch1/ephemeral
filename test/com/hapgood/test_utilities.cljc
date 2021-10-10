@@ -12,3 +12,15 @@
     `(test/async done# (async/go (do ~@body) (done#)))
     ;; In Clojure we block awaiting the completion of the async test block
     `(async/<!! (async/go (do ~@body)))))
+
+(defmacro closing
+  "binding-pair => [name init]
+
+  Evaluates body in a try expression with `name` bound to the value of the
+  init (presumably a channel), and a finally clause that calls closes `name`."
+  [binding-pair & body]
+  `(let ~binding-pair
+     (try
+       (do ~@body)
+       (finally
+         (async/close! ~(binding-pair 0))))))
