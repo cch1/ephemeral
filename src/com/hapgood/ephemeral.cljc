@@ -45,31 +45,24 @@
             now (now)]
         (if-let [[e a c b] (condp = port
                              expiry (do (reset! current (async/promise-chan))
-                                        (tap> {::event {::type ::expiry}})
                                         [nil alarm called-at backoff])
-                             alarm (do
-                                     (tap> {::event {::type ::alarm ::called-at now}})
-                                     (try (acquire eph)
-                                          [expiry nil now 1]
-                                          (catch #?(:clj java.lang.Exception :cljs js/Error) _
-                                            (let [backoff (* 2 backoff)]
-                                              (tap> {::event {::type ::call-failed ::backoff backoff}})
-                                              [expiry (async/timeout backoff) now backoff]))))
+                             alarm (try (acquire eph)
+                                        [expiry nil now 1]
+                                        (catch #?(:clj java.lang.Exception :cljs js/Error) _
+                                          (let [backoff (* 2 backoff)]
+                                            [expiry (async/timeout backoff) now backoff])))
                              source (when-let [[v expires-at] event]
                                       (if (seq event) ; Was a fresh value acquired?
                                         (let [latency (delta-t called-at now)
                                               lifespan (delta-t now expires-at)
                                               [pc pc'] (swap-vals! current (constantly (async/promise-chan)))]
-                                          (tap> {::event {::type ::source ::expires-at expires-at ::latency latency}})
                                           (async/offer! pc v) ; release any previously blocked takes
                                           (async/offer! pc' v)
                                           [(async/timeout lifespan) (async/timeout (- lifespan latency)) nil 1])
                                         (let [backoff (* 2 backoff)]
-                                          (tap> {::event {::type ::source-failed}})
                                           [expiry (async/timeout backoff) nil backoff]))))]
           (recur e a c b)
-          (do (swap! current (fn [pc] (async/close! pc) pc))
-              (tap> {::event {::type ::shutdown}})))))
+          (swap! current (fn [pc] (async/close! pc) pc)))))
     eph))
 
 #?(:clj
