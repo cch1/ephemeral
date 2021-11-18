@@ -18,7 +18,7 @@ jar-file = $(target)/$(PROJECT_NAME)-$(VERSION).jar
 pom-file = $(target)/$(PROJECT_NAME)-$(VERSION).pom.xml
 
 # This is the default target because it is the first real target in this Makefile
-.PHONY: default # Same as "make docker-build"
+.PHONY: default # Same as "make jar"
 default: jar
 
 # https://github.com/git/git/blob/9b88fcef7dd6327cc3aba3927e56fef6f6c4d628/GIT-VERSION-GEN
