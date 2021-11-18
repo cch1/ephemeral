@@ -62,7 +62,7 @@
                                         (let [backoff (* 2 backoff)]
                                           [expiry (async/timeout backoff) nil backoff]))))]
           (recur e a c b)
-          (swap! current (fn [pc] (async/close! pc) pc)))))
+          (async/close! @current))))
     eph))
 
 #?(:clj
