@@ -29,41 +29,48 @@
                      "#<Ephemeral >")))
 
 (defn create
-  "Create an ephemeral that can be supplied by the provided `acquire` function
+  "Create an ephemeral that is be supplied by the provided `acquire` function.  Use the optional
+  `backoffs` sequence to control backoff delays when the `acquire` function reports failure.  The
+  default is exponential backoff capped at 30s.
 
   The `acquire` function is passed the channel-like ephemeral onto which it must place a
   tuple of [`value` `expires-at`] where `expires-at` is the inst at which the ephemeral
-  `value` will expire."
-  [acquire]
-  {:pre [(fn? acquire)]}
-  (let [current (atom (async/promise-chan))
-        source (async/chan 1)
-        eph (->Ephemeral current source)]
-    ;; coordinate the current promise-channel from [value, expires-at] tuples arriving on the source channel
-    (async/go-loop [expiry nil alarm (async/timeout 0) called-at nil backoff 1]
-      (let [[event port] (async/alts! (filter identity [alarm source expiry]))
-            now (now)]
-        (if-let [[e a c b] (condp = port
-                             expiry (do (reset! current (async/promise-chan))
-                                        [nil alarm called-at backoff])
-                             alarm (try (acquire eph)
-                                        [expiry nil now 1]
-                                        (catch #?(:clj java.lang.Exception :cljs js/Error) _
-                                          (let [backoff (* 2 backoff)]
-                                            [expiry (async/timeout backoff) now backoff])))
-                             source (when-let [[v expires-at] event]
-                                      (if (seq event) ; Was a fresh value acquired?
-                                        (let [latency (delta-t called-at now)
-                                              lifespan (delta-t now expires-at)
-                                              [pc pc'] (swap-vals! current (constantly (async/promise-chan)))]
-                                          (async/offer! pc v) ; release any previously blocked takes
-                                          (async/offer! pc' v)
-                                          [(async/timeout lifespan) (async/timeout (- lifespan latency)) nil 1])
-                                        (let [backoff (* 2 backoff)]
-                                          [expiry (async/timeout backoff) nil backoff]))))]
-          (recur e a c b)
-          (async/close! @current))))
-    eph))
+  `value` will expire.  The `acquire` function can synchronously report a retryable failure by
+  throwing an exception.  The `acquire` function can asynchronously report a retryable failure by
+  placing a keyword \"reason code\" on the ephemeral channel.  If the ephemeral channel is closed
+  by `acquire` all resources are freed and no further updates to the ephemeral will be attempted."
+  ([acquire] (let [capped-exponential-backoff (concat (take 15 (iterate (partial * 2) 1)) (repeat 30000))]
+               (create acquire capped-exponential-backoff)))
+  ([acquire backoffs-all]
+   {:pre [(fn? acquire) (seqable? backoffs-all)]}
+   (let [current (atom (async/promise-chan))
+         source (async/chan 1)
+         eph (->Ephemeral current source)]
+     ;; coordinate the current promise-channel from value arriving on the source channel
+     (async/go-loop [expiry nil alarm (async/timeout 0) called-at nil backoffs backoffs-all]
+       (let [[event port] (async/alts! (filter identity [alarm source expiry]))
+             now (now)]
+         (if-let [[e a c b] (condp = port
+                              expiry (do (reset! current (async/promise-chan))
+                                         [nil alarm called-at backoffs])
+                              alarm (try (acquire eph)
+                                         [expiry nil now backoffs]
+                                         (catch #?(:clj java.lang.Exception :cljs js/Error) _
+                                           [expiry (async/timeout (first backoffs)) now (rest backoffs)]))
+                              source (when event
+                                       (if (seqable? event) ; did the acquire fn provide a value tuple?
+                                         (let [[v expires-at] (seq event)
+                                               latency (delta-t called-at now)
+                                               lifespan (delta-t now expires-at)
+                                               [pc pc'] (swap-vals! current (constantly (async/promise-chan)))]
+                                           (async/offer! pc v) ; release any previously blocked takes
+                                           (async/offer! pc' v)
+                                           [(async/timeout lifespan) (async/timeout (- lifespan latency)) nil backoffs-all])
+                                         (let [backoff (first backoffs)]
+                                           [expiry (async/timeout backoff) nil (rest backoffs)]))))]
+           (recur e a c b)
+           (async/close! @current))))
+     eph)))
 
 #?(:clj
    (do (defmethod clojure.core/print-method Ephemeral

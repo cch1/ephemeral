@@ -12,7 +12,7 @@
                            t1ms (+ t0ms delta)]
                        #?(:clj (java.util.Date. t1ms) :cljs (js/Date. t1ms))))
 
-#_(add-tap (fn [{e ::uat/event}] (println e)))
+(add-tap (fn [{e ::uat/event}] (println e)))
 
 (defn- make-supplier
   [n]
@@ -58,7 +58,7 @@
   (go-test (closing [e (create (let [state (atom -5)]
                                  (fn [c] (if (zero? (swap! state inc))
                                            (async/put! c [@state (t+ (now) 1000)])
-                                           (async/put! c [])))))]
+                                           (async/put! c ::unavailable)))))]
                     (is (zero? (async/<! e))))))
 
 (deftest string-representation
