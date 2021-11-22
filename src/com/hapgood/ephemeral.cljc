@@ -15,7 +15,7 @@
 ;; when not holding captured values.  Consider adding some margin to the expiry of ephemeral values (by
 ;; expiring them sooner) and/or conservatively refreshing them.
 ;; TODO: https://blog.klipse.tech/clojurescript/2016/04/26/deftype-explained.html
-(deftype Ephemeral [current source]
+(deftype Ephemeral [current source m]
   impl/ReadPort
   (take! [this fn-handler] (impl/take! @current fn-handler))
   impl/WritePort
@@ -23,6 +23,14 @@
   impl/Channel
   (close! [this] (impl/close! source))
   (closed? [this] (impl/closed? @current))
+  #?@(:clj (clojure.lang.IMeta
+            (meta [this] @m)
+            clojure.lang.IObj
+            (withMeta [this m'] (reset! m m')))
+      :cljs (IMeta
+             (-meta [this] @m)
+             IWithMeta
+             (-with-meta [this m'] (reset! m m')) ))
   Object
   (toString [this] (if-let [v (async/poll! this)]
                      (str "#<Ephemeral " (pr-str v) ">")
@@ -45,7 +53,7 @@
    {:pre [(fn? acquire) (seqable? backoffs-all)]}
    (let [current (atom (async/promise-chan))
          source (async/chan 1)
-         eph (->Ephemeral current source)]
+         eph (->Ephemeral current source (atom {::version 0}))]
      ;; coordinate the current promise-channel from value arriving on the source channel
      (async/go-loop [expiry nil alarm (async/timeout 0) called-at nil backoffs backoffs-all]
        (let [[event port] (async/alts! (filter identity [alarm source expiry]))
@@ -62,11 +70,17 @@
                                          (let [[v expires-at] (seq event)
                                                latency (delta-t called-at now)
                                                lifespan (delta-t now expires-at)
-                                               [pc pc'] (swap-vals! current (constantly (async/promise-chan)))]
+                                               pchan (async/promise-chan)
+                                               [pc pc'] (swap-vals! current (constantly pchan))]
+                                           (vary-meta eph (fn [m] (-> m
+                                                                      (merge {::acquired-at now ::expires-at expires-at ::latency latency})
+                                                                      (assoc ::anomaly nil)
+                                                                      (update ::version inc))))
                                            (async/offer! pc v) ; release any previously blocked takes
                                            (async/offer! pc' v)
                                            [(async/timeout lifespan) (async/timeout (- lifespan latency)) nil backoffs-all])
                                          (let [backoff (first backoffs)]
+                                           (vary-meta eph assoc ::anomaly {::reported-at now ::event event ::backoff backoff})
                                            [expiry (async/timeout backoff) nil (rest backoffs)]))))]
            (recur e a c b)
            (async/close! @current))))

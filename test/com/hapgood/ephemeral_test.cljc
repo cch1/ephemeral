@@ -27,6 +27,11 @@
            (is (satisfies? impl/ReadPort eph))
            (is (satisfies? impl/Channel eph))))
 
+(deftest supports-metadata
+  (closing [eph (create (make-supplier 0))]
+           (is (#?@(:clj (instance? clojure.lang.IObj) :cljs (satisfies? IWithMeta)) eph))
+           (is (#?@(:clj (instance? clojure.lang.IMeta) :cljs (satisfies? IMeta)) eph))))
+
 (deftest unavailable-ephemeral-cannot-be-captured
   (go-test (closing [e (create (make-supplier 1000))]
                     (is (nil? (first (async/alts! [e (async/timeout 10)]))))))) ; timeout while waiting to read
@@ -34,6 +39,16 @@
 (deftest ephemeral-can-be-captured-once-supplied-with-value
   (go-test (closing [e (create (make-supplier 10))]
                     (is (zero? (async/<! e))))))  ; rendez-vous
+
+(deftest metadata-records-acquisition
+  (go-test (closing [e (create (fn [c] (async/put! c [0 (t+ (now) 10000)])))]
+                    (async/<! (async/timeout 10))
+                    (let [m (meta e)]
+                      (is (inst? (m ::uat/acquired-at)))
+                      (is (inst? (m ::uat/expires-at)))
+                      (is (integer? (m ::uat/latency)))
+                      (is (integer? (m ::uat/version)))))))
+
 
 (deftest supplied-values-expire
   (go-test (closing [e (create (let [state (atom -1)] ; only supply one value
@@ -60,6 +75,13 @@
                                            (async/put! c [@state (t+ (now) 1000)])
                                            (async/put! c ::unavailable)))))]
                     (is (zero? (async/<! e))))))
+
+(deftest acquire-failure-recorded-in-metadata
+  (go-test (closing [e (create (fn [c] (async/put! c ::unavailable)))]
+                    (async/<! (async/timeout 100))
+                    (let [anomaly (-> e meta ::uat/anomaly)]
+                      (is (integer? (anomaly ::uat/backoff)))
+                      (is (= ::unavailable (anomaly ::uat/event)))))))
 
 (deftest string-representation
   (closing [e (create (make-supplier 100))]
