@@ -44,12 +44,12 @@ Acquisition metrics and failure status are tracked in the metadata of the epheme
 Ephemerals are not values and are not suitable for serialization.
 
 ### Shutdown
-To free up the resources used by the ephemeral, close it as you would close an async channel.
+To free up the resources used by the ephemeral, close it as you would close a core.async channel.
 
 ### Troubleshooting
-The acquire function is automatically rescheduled if synchronously throws an exception or reports a failure asynchronously.  However, if it silently fails to place a value on the ephemeral channel it will not ever be rescheduled.
+The acquire function is automatically rescheduled if synchronously throws an exception or reports a failure asynchronously.  However, if it neither throws an exception synchronously nor places a value on the ephemeral channel it will not ever be rescheduled.
 
 ### TODO
-1. Consider making the metadata read-only.
+1. Consider making the metadata read-only.  Pros: metrics can't be overwritten.  Cons: reduced utility.
 2. Consider using mutable fields instead of atoms for internal state.
 3. Enhance printing to leverage metatdata.

@@ -41,12 +41,14 @@
   `backoffs` sequence to control backoff delays when the `acquire` function reports failure.  The
   default is exponential backoff capped at 30s.
 
-  The `acquire` function is passed the channel-like ephemeral onto which it must place a
-  tuple of [`value` `expires-at`] where `expires-at` is the inst at which the ephemeral
-  `value` will expire.  The `acquire` function can synchronously report a retryable failure by
-  throwing an exception.  The `acquire` function can asynchronously report a retryable failure by
-  placing a keyword \"reason code\" on the ephemeral channel.  If the ephemeral channel is closed
-  by `acquire` all resources are freed and no further updates to the ephemeral will be attempted."
+  The `acquire` function is passed the channel-like ephemeral onto which it must place a tuple
+  of [`value` `expires-at`] where `expires-at` is the inst at which the ephemeral `value` will
+  expire.  The `acquire` function can synchronously report a retryable failure by throwing an
+  exception.  The `acquire` function can asynchronously report a retryable failure by placing a
+  value that does not satisfy `sequential?` on the ephemeral channel.
+
+  If the ephemeral channel is closed all resources are freed and no further updates to the
+  ephemeral will be attempted."
   ([acquire] (let [capped-exponential-backoff (concat (take 15 (iterate (partial * 2) 1)) (repeat 30000))]
                (create acquire capped-exponential-backoff)))
   ([acquire backoffs-all]
