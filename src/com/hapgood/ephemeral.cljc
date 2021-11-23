@@ -66,8 +66,8 @@
                                          (catch #?(:clj java.lang.Exception :cljs js/Error) _
                                            [expiry (async/timeout (first backoffs)) now (rest backoffs)]))
                               source (when event
-                                       (if (seqable? event) ; did the acquire fn provide a value tuple?
-                                         (let [[v expires-at] (seq event)
+                                       (if (sequential? event) ; did the acquire fn provide a value tuple?
+                                         (let [[v expires-at] event
                                                latency (delta-t called-at now)
                                                lifespan (delta-t now expires-at)
                                                pchan (async/promise-chan)
