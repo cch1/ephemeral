@@ -19,13 +19,13 @@ The ephemeral pattern is well-suited for managing the fresh supply of expiring c
 (require '[com.hapgood.ephemeral :as ephemeral])
 
 (defn acquire
-  [c]
+  [e]
   (http/get token-server-url
             {:on-success (fn [response]
-                           ...
                            (let [token (extract-token response)
                                  expires-at (extract-expiry response)]
-                             (async/put! c [token expires-at])))}))
+			     (async/put! e [token expires-at])))
+	     :on-failure (fn [] (async/put! e :failed))}))
 
 (def e (ephemeral/create acquire))
 
