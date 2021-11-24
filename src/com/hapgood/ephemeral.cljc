@@ -15,14 +15,14 @@
 ;; when not holding captured values.  Consider adding some margin to the expiry of ephemeral values (by
 ;; expiring them sooner) and/or conservatively refreshing them.
 ;; TODO: https://blog.klipse.tech/clojurescript/2016/04/26/deftype-explained.html
-(deftype Ephemeral [current source m]
+(deftype Ephemeral [out-ref in m]
   impl/ReadPort
-  (take! [this fn-handler] (impl/take! @current fn-handler))
+  (take! [this fn-handler] (impl/take! @out-ref fn-handler))
   impl/WritePort
-  (put! [port val fn1-handler] (impl/put! source val fn1-handler))
+  (put! [port val fn1-handler] (impl/put! in val fn1-handler))
   impl/Channel
-  (close! [this] (impl/close! source))
-  (closed? [this] (impl/closed? @current))
+  (close! [this] (impl/close! in))
+  (closed? [this] (impl/closed? @out-ref))
   #?@(:clj (clojure.lang.IMeta
             (meta [this] @m)
             clojure.lang.IObj
@@ -53,40 +53,40 @@
                (create acquire capped-exponential-backoff)))
   ([acquire backoffs-all]
    {:pre [(fn? acquire) (seqable? backoffs-all)]}
-   (let [current (atom (async/promise-chan))
-         source (async/chan 1)
-         eph (->Ephemeral current source (atom {::version 0}))]
-     ;; coordinate the current promise-channel from value arriving on the source channel
+   (let [out-ref (atom (async/promise-chan))
+         in (async/chan 1)
+         eph (->Ephemeral out-ref in (atom {::version 0}))]
+     ;; coordinate the out-ref promise-channel from value arriving on the in channel
      (async/go-loop [expiry nil alarm (async/timeout 0) called-at nil backoffs backoffs-all]
-       (let [[event port] (async/alts! (filter identity [alarm source expiry]))
+       (let [[event port] (async/alts! (filter identity [alarm in expiry]))
              now (now)]
          (if-let [[e a c b] (condp = port
-                              expiry (do (reset! current (async/promise-chan))
+                              expiry (do (reset! out-ref (async/promise-chan))
                                          [nil alarm called-at backoffs])
                               alarm (try (acquire eph)
                                          [expiry nil now backoffs]
                                          (catch #?(:clj java.lang.Exception :cljs js/Error) _
                                            [expiry (async/timeout (first backoffs)) now (rest backoffs)]))
-                              source (when event
-                                       (if (sequential? event) ; did the acquire fn provide a value tuple?
-                                         (let [[v expires-at] event
-                                               latency (delta-t called-at now)
-                                               lifespan (delta-t now expires-at)]
-                                           (if (pos? lifespan)
-                                             (let [[pc pc'] (swap-vals! current (constantly (async/promise-chan)))]
-                                               (vary-meta eph (fn [m] (-> m
-                                                                          (merge {::acquired-at now ::expires-at expires-at ::latency latency})
-                                                                          (assoc ::anomaly nil)
-                                                                          (update ::version inc))))
-                                               (async/offer! pc v) ; release any previously blocked takes
-                                               (async/offer! pc' v)
-                                               [(async/timeout lifespan) (async/timeout (- lifespan latency)) nil backoffs-all])
-                                             [expiry (async/timeout 0) nil backoffs-all]))
-                                         (let [backoff (first backoffs)]
-                                           (vary-meta eph assoc ::anomaly {::reported-at now ::event event ::backoff backoff})
-                                           [expiry (async/timeout backoff) nil (rest backoffs)]))))]
+                              in (when event
+                                   (if (sequential? event) ; did the acquire fn provide a value tuple?
+                                     (let [[v expires-at] event
+                                           latency (delta-t called-at now)
+                                           lifespan (delta-t now expires-at)]
+                                       (if (pos? lifespan)
+                                         (let [[pc pc'] (swap-vals! out-ref (constantly (async/promise-chan)))]
+                                           (vary-meta eph (fn [m] (-> m
+                                                                      (merge {::acquired-at now ::expires-at expires-at ::latency latency})
+                                                                      (assoc ::anomaly nil)
+                                                                      (update ::version inc))))
+                                           (async/offer! pc v) ; release any previously blocked takes
+                                           (async/offer! pc' v)
+                                           [(async/timeout lifespan) (async/timeout (- lifespan latency)) nil backoffs-all])
+                                         [expiry (async/timeout 0) nil backoffs-all]))
+                                     (let [backoff (first backoffs)]
+                                       (vary-meta eph assoc ::anomaly {::reported-at now ::event event ::backoff backoff})
+                                       [expiry (async/timeout backoff) nil (rest backoffs)]))))]
            (recur e a c b)
-           (async/close! @current))))
+           (async/close! @out-ref))))
      eph)))
 
 #?(:clj
