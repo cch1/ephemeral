@@ -42,7 +42,7 @@
 
 (deftest metadata-records-acquisition
   (go-test (closing [e (create (fn [c] (async/put! c [0 (t+ (now) 10000)])))]
-                    (async/<! (async/timeout 10))
+                    (async/<! e)
                     (let [m (meta e)]
                       (is (inst? (m ::uat/acquired-at)))
                       (is (inst? (m ::uat/expires-at)))
