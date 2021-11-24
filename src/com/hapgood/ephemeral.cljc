@@ -15,7 +15,7 @@
   impl/WritePort
   (put! [port val fn1-handler] (impl/put! in val fn1-handler))
   impl/Channel
-  (close! [this] (impl/close! in))
+  (close! [this] (impl/close! in) (impl/close! @out-ref))
   (closed? [this] (impl/closed? @out-ref))
   #?@(:clj (clojure.lang.IMeta
             (meta [this] @m)
@@ -54,33 +54,32 @@
      (async/go-loop [expiry nil alarm (async/timeout 0) called-at nil backoffs backoffs-all]
        (let [[event port] (async/alts! (filter identity [alarm in expiry]))
              now (now)]
-         (if-let [[e a c b] (condp = port
-                              expiry (do (reset! out-ref (async/promise-chan))
-                                         [nil alarm called-at backoffs])
-                              alarm (try (acquire eph)
-                                         [expiry nil now backoffs]
-                                         (catch #?(:clj java.lang.Exception :cljs js/Error) _
-                                           [expiry (async/timeout (first backoffs)) now (rest backoffs)]))
-                              in (when event
-                                   (if (sequential? event) ; did the acquire fn provide a value tuple?
-                                     (let [[v expires-at] event
-                                           latency (delta-t called-at now)
-                                           lifespan (delta-t now expires-at)]
-                                       (if (pos? lifespan)
-                                         (let [[pc pc'] (swap-vals! out-ref (constantly (async/promise-chan)))]
-                                           (vary-meta eph (fn [m] (-> m
-                                                                      (merge {::acquired-at now ::expires-at expires-at ::latency latency})
-                                                                      (assoc ::anomaly nil)
-                                                                      (update ::version inc))))
-                                           (async/offer! pc v) ; release any previously blocked takes
-                                           (async/offer! pc' v)
-                                           [(async/timeout lifespan) (async/timeout (- lifespan latency)) nil backoffs-all])
-                                         [expiry (async/timeout 0) nil backoffs-all]))
-                                     (let [backoff (first backoffs)]
-                                       (vary-meta eph assoc ::anomaly {::reported-at now ::event event ::backoff backoff})
-                                       [expiry (async/timeout backoff) nil (rest backoffs)]))))]
-           (recur e a c b)
-           (async/close! @out-ref))))
+         (when-let [[e a c b] (condp = port
+                                expiry (do (reset! out-ref (async/promise-chan))
+                                           [nil alarm called-at backoffs])
+                                alarm (try (acquire eph)
+                                           [expiry nil now backoffs]
+                                           (catch #?(:clj java.lang.Exception :cljs js/Error) _
+                                             [expiry (async/timeout (first backoffs)) now (rest backoffs)]))
+                                in (when event
+                                     (if (sequential? event) ; did the acquire fn provide a value tuple?
+                                       (let [[v expires-at] event
+                                             latency (delta-t called-at now)
+                                             lifespan (delta-t now expires-at)]
+                                         (if (pos? lifespan)
+                                           (let [[pc pc'] (swap-vals! out-ref (constantly (async/promise-chan)))]
+                                             (vary-meta eph (fn [m] (-> m
+                                                                        (merge {::acquired-at now ::expires-at expires-at ::latency latency})
+                                                                        (assoc ::anomaly nil)
+                                                                        (update ::version inc))))
+                                             (async/offer! pc v) ; release any previously blocked takes
+                                             (async/offer! pc' v)
+                                             [(async/timeout lifespan) (async/timeout (- lifespan latency)) nil backoffs-all])
+                                           [expiry (async/timeout 0) nil backoffs-all]))
+                                       (let [backoff (first backoffs)]
+                                         (vary-meta eph assoc ::anomaly {::reported-at now ::event event ::backoff backoff})
+                                         [expiry (async/timeout backoff) nil (rest backoffs)]))))]
+           (recur e a c b))))
      eph)))
 
 #?(:clj
