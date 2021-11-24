@@ -8,12 +8,6 @@
 (defn- delta-t [t0 t1] (- (inst-ms t1) (inst-ms t0)))
 
 ;; A channel-like type that coordinates the supply of fresh ephemeral values.
-;; Unlimited takes of a fresh value may be performed.  When the value expires, the ephemeral channel will block on takes.
-;; The ephemeral channel cycles between these two states based on the timely supply of fresh values.
-;; NB: Avoid TOCTOU (time-of-check-time-of-use) race conditions by never holding a captured value -that
-;; defeats the ephemeral pattern.  Due to network and processing delays TOCTOU is a potential problem even
-;; when not holding captured values.  Consider adding some margin to the expiry of ephemeral values (by
-;; expiring them sooner) and/or conservatively refreshing them.
 ;; TODO: https://blog.klipse.tech/clojurescript/2016/04/26/deftype-explained.html
 (deftype Ephemeral [out-ref in m]
   impl/ReadPort
