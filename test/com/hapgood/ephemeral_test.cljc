@@ -49,13 +49,20 @@
                       (is (integer? (m ::uat/latency)))
                       (is (integer? (m ::uat/version)))))))
 
-
 (deftest supplied-values-expire
   (go-test (closing [e (create (let [state (atom -1)] ; only supply one value
                                  (fn [c] (when (zero? (swap! state inc)) (async/put! c [@state (t+ (now) 100)])))))]
                     (is (zero? (async/<! e))) ; rendez-vous
                     (async/<! (async/timeout 110)) ; wait for the value to expire...
                     (is (nil? (first (async/alts! [e (async/timeout 10)]))))))) ; timeout while waiting to read
+
+(deftest pre-expired-values-trigger-acquire ; without unblocking consumers...
+  (go-test (closing [e (create (let [state (atom -5)] ; supply four stale values before supplying a fresh value
+                                 (fn [c]
+                                   (if (neg? (swap! state inc))
+                                     (async/put! c [@state (t+ (now) -100)])
+                                     (async/put! c [@state (t+ (now) 1000)])))))]
+                    (is (zero? (async/<! e))))))
 
 (deftest exceptions-supplying-value-are-caught-and-retried
   (go-test (closing [e (create (let [state (atom -5)] ; fail four times and then supply a value

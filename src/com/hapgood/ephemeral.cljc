@@ -71,16 +71,17 @@
                                        (if (sequential? event) ; did the acquire fn provide a value tuple?
                                          (let [[v expires-at] event
                                                latency (delta-t called-at now)
-                                               lifespan (delta-t now expires-at)
-                                               pchan (async/promise-chan)
-                                               [pc pc'] (swap-vals! current (constantly pchan))]
-                                           (vary-meta eph (fn [m] (-> m
-                                                                      (merge {::acquired-at now ::expires-at expires-at ::latency latency})
-                                                                      (assoc ::anomaly nil)
-                                                                      (update ::version inc))))
-                                           (async/offer! pc v) ; release any previously blocked takes
-                                           (async/offer! pc' v)
-                                           [(async/timeout lifespan) (async/timeout (- lifespan latency)) nil backoffs-all])
+                                               lifespan (delta-t now expires-at)]
+                                           (if (pos? lifespan)
+                                             (let [[pc pc'] (swap-vals! current (constantly (async/promise-chan)))]
+                                               (vary-meta eph (fn [m] (-> m
+                                                                          (merge {::acquired-at now ::expires-at expires-at ::latency latency})
+                                                                          (assoc ::anomaly nil)
+                                                                          (update ::version inc))))
+                                               (async/offer! pc v) ; release any previously blocked takes
+                                               (async/offer! pc' v)
+                                               [(async/timeout lifespan) (async/timeout (- lifespan latency)) nil backoffs-all])
+                                             [expiry (async/timeout 0) nil backoffs-all]))
                                          (let [backoff (first backoffs)]
                                            (vary-meta eph assoc ::anomaly {::reported-at now ::event event ::backoff backoff})
                                            [expiry (async/timeout backoff) nil (rest backoffs)]))))]
