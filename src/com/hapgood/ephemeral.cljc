@@ -67,7 +67,7 @@
                                              latency (delta-t called-at now)
                                              lifespan (delta-t now expires-at)]
                                          (if (pos? lifespan)
-                                           (let [[pc pc'] (swap-vals! out-ref (constantly (async/promise-chan)))]
+                                           (let [[pc pc'] (reset-vals! out-ref (async/promise-chan))]
                                              (vary-meta eph (fn [m] (-> m
                                                                         (merge {::acquired-at now ::expires-at expires-at ::latency latency})
                                                                         (assoc ::anomaly nil)
