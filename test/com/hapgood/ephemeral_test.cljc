@@ -41,13 +41,13 @@
                     (is (zero? (async/<! e))))))  ; rendez-vous
 
 (deftest metadata-records-acquisition
-  (go-test (closing [e (create (fn [c] (async/put! c [0 (t+ (now) 10000)])))]
+  (go-test (closing [e (create (make-supplier 1))]
                     (async/<! e)
                     (let [m (meta e)]
                       (is (inst? (m ::uat/acquired-at)))
                       (is (inst? (m ::uat/expires-at)))
-                      (is (integer? (m ::uat/latency)))
-                      (is (integer? (m ::uat/version)))))))
+                      (is (pos-int? (m ::uat/latency)))
+                      (is (pos-int? (m ::uat/version)))))))
 
 (deftest supplied-values-expire
   (go-test (closing [e (create (let [state (atom -1)] ; only supply one value
