@@ -1,3 +1,3 @@
-java adoptopenjdk-8.0.292+10
-clojure 1.10.2.796
+java openjdk-17.0.2
+clojure 1.10.3.1075
 nodejs 16.4.0
