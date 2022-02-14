@@ -78,12 +78,11 @@
                                        (let [[v expires-at] event
                                              latency (delta-t called-at now)
                                              lifespan (delta-t now expires-at)]
+                                         (vary-meta eph (fn [m] (-> m
+                                                                    (merge {::acquired-at now ::expires-at expires-at ::latency latency ::anomaly nil})
+                                                                    (update ::version inc))))
                                          (if (pos? lifespan)
                                            (let [[pc pc'] (reset-vals! out-ref (async/promise-chan))]
-                                             (vary-meta eph (fn [m] (-> m
-                                                                        (merge {::acquired-at now ::expires-at expires-at ::latency latency})
-                                                                        (assoc ::anomaly nil)
-                                                                        (update ::version inc))))
                                              (async/offer! pc v) ; release any previously blocked takes
                                              (async/offer! pc' v)
                                              [(async/timeout lifespan) (async/timeout (- lifespan latency)) nil backoffs-all])

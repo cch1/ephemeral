@@ -90,6 +90,15 @@
                                            (async/put! c ::unavailable)))))]
                     (is (zero? (async/<! e))))))
 
+(deftest acquire-supplying-stale-value-reflected-in-metadata
+  (go-test (closing [e (create (let [state (atom -5)]
+                                 (fn [c] (if (zero? (swap! state inc))
+                                           (async/put! c [@state (t+ (now) 1000)])
+                                           (async/put! c [@state (now)])))))]
+                    (async/<! (async/timeout 100))
+                    (is (zero? (async/<! e)))
+                    (is (= 5 (-> e meta ::uat/version))))))
+
 (deftest acquire-failure-recorded-in-metadata
   (go-test (closing [e (create (fn [c] (async/put! c ::unavailable)))]
                     (async/<! (async/timeout 100))
