@@ -24,7 +24,19 @@
       :cljs (IMeta
              (-meta [this] @m)
              IWithMeta
-             (-with-meta [this m'] (reset! m m')) ))
+             (-with-meta [this m'] (reset! m m'))))
+  ;; Inspired by https://clojure.atlassian.net/browse/ASYNC-102
+  #?@(:clj (clojure.lang.IDeref ; This interface is semantically inappropriate for ClojureScript, right?
+            (deref [this]
+                   (let [p (promise)]
+                     (async/take! this (fn [x] (deliver p x)))
+                     (deref p)))
+            clojure.lang.IBlockingDeref
+            (deref [this timeout fallback]
+                   (let [t (async/timeout timeout)
+                         p (promise)
+                         [val port] (async/alts!! [t this])]
+                     (if (= this port) val fallback)))))
   Object
   (toString [this] (if-let [v (async/poll! this)]
                      (str "#<Ephemeral " (pr-str v) ">")

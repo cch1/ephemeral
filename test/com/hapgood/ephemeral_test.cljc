@@ -40,6 +40,13 @@
   (go-test (closing [e (create (make-supplier 10))]
                     (is (zero? (async/<! e))))))  ; rendez-vous
 
+#?(:clj (deftest ephemeral-supports-reference-interfaces
+          (closing [e (create (make-supplier 1))]
+                   (is (zero? (deref e))))
+          (closing [e (create (make-supplier 500))]
+                   (is (= :timeout (deref e 10 :timeout)))
+                   (is (zero? (deref e 1000 :timeout))))))
+
 (deftest metadata-records-acquisition
   (go-test (closing [e (create (make-supplier 1))]
                     (async/<! e)
