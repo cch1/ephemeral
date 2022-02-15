@@ -42,7 +42,15 @@
                      (str "#<Ephemeral " (pr-str v) ">")
                      "#<Ephemeral >")))
 
-(defmulti schedule (fn [v latency] (type v)))
+(defmulti schedule
+  "Schedule the optional expiration and refreshing of the ephemeral value.  Implementations
+  should return a tuple of [`expires-at` `refresh-after`] where `expires-at` is an optional instant
+  when the value should expire and `refresh-after` is an integer duration before an attempt should
+  be made to refresh the ephemeral value.  If `expires-at` is nil, the value will considered fresh
+  and be supplied to consumers indefinitely.  If `refresh-after` is negative then the value is
+  already stale and will never be returned to consumers.  The schedule multimethod is called with
+  the `t` value returned by the acquire function and the measured `latency` of the acquisition."
+  (fn [t latency] (type t)))
 (defmethod schedule #?(:clj java.lang.Long :cljs js/Number) [interval latency]
   (let [refresh-after (max 0 (- interval latency))]
     [nil refresh-after]))
@@ -59,10 +67,11 @@
   default is exponential backoff capped at 30s.
 
   The `acquire` function is passed the channel-like ephemeral onto which it must place a tuple
-  of [`value` `expires-at`] where `expires-at` is the inst at which the ephemeral `value` will
-  expire.  The `acquire` function can synchronously report a retryable failure by throwing an
-  exception.  The `acquire` function can asynchronously report a retryable failure by placing a
-  value that does not satisfy `sequential?` on the ephemeral channel.
+  of [`value` `t`] where `t` informs the schedule for refreshing and optionally expiring the
+  ephemeral `value` (determined by the `schedule` multimethod).  The `acquire` function can
+  synchronously report a retryable failure by throwing an exception.  The `acquire` function
+  can asynchronously report a retryable failure by placing a value that does not satisfy
+  `sequential?` on the ephemeral channel.
 
   If the ephemeral channel is closed all resources are freed and no further updates to the
   ephemeral will be attempted."
@@ -77,32 +86,32 @@
      (async/go-loop [expiry nil alarm (async/timeout 0) called-at nil backoffs backoffs-all]
        (let [[event port] (async/alts! (filter identity [alarm in expiry]))
              now (now)]
-         (when-let [[e a c b] (condp = port
-                                expiry (do (reset! out-ref (async/promise-chan))
-                                           [nil alarm called-at backoffs])
-                                alarm (try (acquire eph)
-                                           [expiry nil now backoffs]
-                                           (catch #?(:clj java.lang.Exception :cljs js/Error) _
-                                             [expiry (async/timeout (first backoffs)) now (rest backoffs)]))
-                                in (when event
-                                     (if (sequential? event) ; did the acquire fn provide a value tuple?
-                                       (let [[v expires-at] event
-                                             latency (delta-t called-at now)
-                                             [expire-at refresh-after] (schedule expires-at latency)
-                                             fresh? (not (neg? refresh-after))
-                                             expire-after (when (and fresh? expire-at) (delta-t now expire-at))]
-                                         (vary-meta eph #(-> %
-                                                             (merge {::acquired-at now ::expires-at expire-at ::latency latency ::anomaly nil})
-                                                             (update ::version inc)))
-                                         (when fresh?
-                                           (let [[pc pc'] (reset-vals! out-ref (async/promise-chan))]
-                                             (async/offer! pc v) ; release any previously blocked takes
-                                             (async/offer! pc' v)))
-                                         [(when expire-after (async/timeout expire-after)) (async/timeout refresh-after) nil backoffs-all])
-                                       (let [backoff (first backoffs)]
-                                         (vary-meta eph assoc ::anomaly {::reported-at now ::event event ::backoff backoff})
-                                         [expiry (async/timeout backoff) nil (rest backoffs)]))))]
-           (recur e a c b))))
+         (when-let [[e a c bs] (condp = port
+                                 expiry (do (reset! out-ref (async/promise-chan))
+                                            [nil alarm called-at backoffs])
+                                 alarm (try (acquire eph)
+                                            [expiry nil now backoffs]
+                                            (catch #?(:clj java.lang.Exception :cljs js/Error) _
+                                              [expiry (async/timeout (first backoffs)) now (rest backoffs)]))
+                                 in (when event
+                                      (if (sequential? event) ; did the acquire fn provide a value tuple?
+                                        (let [[v expires-at] event
+                                              latency (delta-t called-at now)
+                                              [expire-at refresh-after] (schedule expires-at latency)
+                                              fresh? (not (neg? refresh-after))
+                                              expire-after (when (and fresh? expire-at) (delta-t now expire-at))]
+                                          (vary-meta eph #(-> %
+                                                              (merge {::acquired-at now ::expires-at expire-at ::latency latency ::anomaly nil})
+                                                              (update ::version inc)))
+                                          (when fresh?
+                                            (let [[pc pc'] (reset-vals! out-ref (async/promise-chan))]
+                                              (async/offer! pc v) ; release any previously blocked takes
+                                              (async/offer! pc' v)))
+                                          [(when expire-after (async/timeout expire-after)) (async/timeout refresh-after) nil backoffs-all])
+                                        (let [backoff (first backoffs)]
+                                          (vary-meta eph assoc ::anomaly {::reported-at now ::event event ::backoff backoff})
+                                          [expiry (async/timeout backoff) nil (rest backoffs)]))))]
+           (recur e a c bs))))
      eph)))
 
 #?(:clj
