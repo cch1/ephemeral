@@ -76,7 +76,7 @@ $(pom-file): deps.edn | $(target)/
 	mv pom.xml $(DESTDIR)$@
 
 $(jar-file): deps.edn $(pom-file) $(shell find src/ -type f -or -name '*.clj' -name '*.cljc') | $(target)/
-	clojure -X:project/jar :pom-file \"$(DESTDIR)$(pom-file)\" :jar \"$@\"
+	clojure -X:project/jar :pom-file \"$(DESTDIR)$(pom-file)\" :jar \"$@\" :main-class com.hapgood.ephemeral :aot false
 
 .PHONY: pom # Create the pom.xml file
 pom: $(pom-file)
