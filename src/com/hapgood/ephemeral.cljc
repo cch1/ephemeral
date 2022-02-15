@@ -42,6 +42,17 @@
                      (str "#<Ephemeral " (pr-str v) ">")
                      "#<Ephemeral >")))
 
+(defmulti schedule (fn [v latency] (type v)))
+(defmethod schedule #?(:clj java.lang.Long :cljs js/Number) [interval latency]
+  (let [refresh-after (max 0 (- interval latency))]
+    [nil refresh-after]))
+(defmethod schedule :default [inst latency]
+  {:pre [(inst? inst)]}
+  (let [lifespan (delta-t (now) inst)
+        refresh-after (- lifespan latency)
+        fresh? (not (neg? refresh-after))]
+    [(when fresh? inst) refresh-after]))
+
 (defn create
   "Create an ephemeral that is be supplied by the provided `acquire` function.  Use the optional
   `backoffs` sequence to control backoff delays when the `acquire` function reports failure.  The
@@ -77,16 +88,17 @@
                                      (if (sequential? event) ; did the acquire fn provide a value tuple?
                                        (let [[v expires-at] event
                                              latency (delta-t called-at now)
-                                             lifespan (delta-t now expires-at)]
-                                         (vary-meta eph (fn [m] (-> m
-                                                                    (merge {::acquired-at now ::expires-at expires-at ::latency latency ::anomaly nil})
-                                                                    (update ::version inc))))
-                                         (if (pos? lifespan)
+                                             [expire-at refresh-after] (schedule expires-at latency)
+                                             fresh? (not (neg? refresh-after))
+                                             expire-after (when (and fresh? expire-at) (delta-t now expire-at))]
+                                         (vary-meta eph #(-> %
+                                                             (merge {::acquired-at now ::expires-at expire-at ::latency latency ::anomaly nil})
+                                                             (update ::version inc)))
+                                         (when fresh?
                                            (let [[pc pc'] (reset-vals! out-ref (async/promise-chan))]
                                              (async/offer! pc v) ; release any previously blocked takes
-                                             (async/offer! pc' v)
-                                             [(async/timeout lifespan) (async/timeout (- lifespan latency)) nil backoffs-all])
-                                           [expiry (async/timeout 0) nil backoffs-all]))
+                                             (async/offer! pc' v)))
+                                         [(when expire-after (async/timeout expire-after)) (async/timeout refresh-after) nil backoffs-all])
                                        (let [backoff (first backoffs)]
                                          (vary-meta eph assoc ::anomaly {::reported-at now ::event event ::backoff backoff})
                                          [expiry (async/timeout backoff) nil (rest backoffs)]))))]

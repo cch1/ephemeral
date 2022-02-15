@@ -47,6 +47,14 @@
                    (is (= :timeout (deref e 10 :timeout)))
                    (is (zero? (deref e 1000 :timeout))))))
 
+(deftest refreshes-non-expiring-values
+  (go-test (closing [e (create (let [state (atom -2)] ; only supply two values that each go stale in 1ms
+                                 (fn [c] (when ((complement pos?) (swap! state inc)) (async/put! c [@state 1])))))]
+                    (async/<! (async/timeout 100))
+                    (is (zero? (async/<! e)))
+                    (is (nil? (-> e meta ::uat/expires-at)))
+                    (is (= 2 (-> e meta ::uat/version))))))
+
 (deftest metadata-records-acquisition
   (go-test (closing [e (create (make-supplier 1))]
                     (async/<! e)
