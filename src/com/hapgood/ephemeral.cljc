@@ -1,30 +1,59 @@
 (ns com.hapgood.ephemeral
   (:require [clojure.pprint]
             [clojure.core.async :as async]
-            [clojure.core.async.impl.protocols :as impl]))
+            [clojure.core.async.impl.protocols :as impl]
+            [com.hapgood.ephemeral.buffers :refer [resettable-promise-buffer]]))
 
-(defn- now [] #?(:clj (java.util.Date.) :cljs (js/Date.)))
+(defprotocol Stateful
+  (inspect [this] "Return the state of this."))
 
-(defn- delta-t [t0 t1] (- (inst-ms t1) (inst-ms t0)))
+(defn- now [] #?(:clj (System/currentTimeMillis) :cljs (inst-ms (js/Date.))))
+
+(defn- insist
+  "Resiliently evaluate the function `f`.  Returns a channel whose only value
+  is the return of `f`.  If `f` returns nil or throws an exception, it is
+  retried after a delay (in ms) taken from `backoffs`."
+  [f backoffs >metrics]
+  {:pre [(instance? clojure.lang.IFn f) (seqable? backoffs)]}
+  (swap! >metrics assoc :acquire {:started-at (now) :invoked 0 :pending 0 :failed 0 :retries 0})
+  (async/go-loop [ret nil t (async/timeout 0) backoffs backoffs]
+    (let [[event port] (async/alts! (filter identity [ret t]))]
+      (condp = port
+        t (do (swap! >metrics update :acquire #(-> %
+                                                   (update :invoked inc)
+                                                   (update :pending inc)))
+              (recur #?(:clj (async/thread (f)) :cljs (async/go (f))) nil backoffs))
+        ret (do (swap! >metrics update-in [:acquire :pending] dec)
+                (if (some? event)
+                  event
+                  (do (swap! >metrics update-in [:acquire :failed] inc)
+                      (when-let [backoff (first backoffs)]
+                        (swap! >metrics update :acquire #(-> %
+                                                             (update :retries inc)
+                                                             (assoc :last-backoff backoff)))
+                        (recur nil (async/timeout backoff) (rest backoffs))))))))))
 
 ;; A channel-like type that coordinates the supply of fresh ephemeral values.
 ;; TODO: https://blog.klipse.tech/clojurescript/2016/04/26/deftype-explained.html
-(deftype Ephemeral [out-ref in m]
+(deftype Ephemeral [acquire >k kf vf ef rf out trigger >metrics]
   impl/ReadPort
-  (take! [this fn-handler] (impl/take! @out-ref fn-handler))
+  (take! [this fn1-handler]
+    (swap! >metrics update :takes inc)
+    (let [ret (impl/take! out fn1-handler)] ; ret is nil if take was enqueued
+      (when (nil? ret)
+        (swap! >metrics update :takes-deferred inc)
+        (async/offer! trigger true))
+      ret))
   impl/WritePort
-  (put! [port val fn1-handler] (impl/put! in val fn1-handler))
+  (put! [this v fn1-handler]
+    (swap! >metrics update :puts inc)
+    (impl/put! out v fn1-handler))
   impl/Channel
-  (close! [this] (impl/close! in) (impl/close! @out-ref))
-  (closed? [this] (impl/closed? @out-ref))
-  #?@(:clj (clojure.lang.IMeta
-            (meta [this] @m)
-            clojure.lang.IObj
-            (withMeta [this m'] (reset! m m')))
-      :cljs (IMeta
-             (-meta [this] @m)
-             IWithMeta
-             (-with-meta [this m'] (reset! m m'))))
+  (close! [this]
+    (swap! >metrics assoc :closed? true :closed-at (now))
+    (async/close! trigger)
+    (impl/close! out))
+  (closed? [this] (impl/closed? out))
   ;; Inspired by https://clojure.atlassian.net/browse/ASYNC-102
   #?@(:clj (clojure.lang.IDeref ; This interface is semantically inappropriate for ClojureScript, right?
             (deref [this]
@@ -34,85 +63,110 @@
             clojure.lang.IBlockingDeref
             (deref [this timeout fallback]
                    (let [t (async/timeout timeout)
-                         p (promise)
                          [val port] (async/alts!! [t this])]
-                     (if (= this port) val fallback)))))
+                     (if (= this port) val fallback)))
+            clojure.lang.IPending
+            (isRealized [this] (boolean (async/poll! this)))))
+  clojure.lang.IFn
+  (invoke [this] (try (when-some [result (acquire @>k)]
+                        (let [[k v e r] ((juxt kf vf ef rf) result)]
+                          (reset! >k k)
+                          (if (and v ((some-fn nil? pos?) e)) ; fresh?
+                            (do (swap! >metrics update :fresh-acquisitions inc)
+                                (async/put! this v)
+                                [e r])
+                            (do (swap! >metrics update :stale-acquisitions inc)
+                                [nil 0]))))
+                      (catch Exception e
+                        (swap! >metrics assoc :last-acquisition-exception e)
+                        nil)))
+  Stateful
+  (inspect [this] [@>k @>metrics (async/poll! this) (impl/closed? out)])
   Object
   (toString [this] (if-let [v (async/poll! this)]
                      (str "#<Ephemeral " (pr-str v) ">")
                      "#<Ephemeral >")))
 
-(defmulti schedule
-  "Schedule the optional expiration and refreshing of the ephemeral value.  Implementations
-  should return a tuple of [`expires-at` `refresh-after`] where `expires-at` is an optional instant
-  when the value should expire and `refresh-after` is an integer duration before an attempt should
-  be made to refresh the ephemeral value.  If `expires-at` is nil, the value will considered fresh
-  and be supplied to consumers indefinitely.  If `refresh-after` is negative then the value is
-  already stale and will never be returned to consumers.  The schedule multimethod is called with
-  the `t` value returned by the acquire function and the measured `latency` of the acquisition."
-  (fn [t latency] (type t)))
-(defmethod schedule #?(:clj java.lang.Long :cljs js/Number) [interval latency]
-  (let [refresh-after (max 0 (- interval latency))]
-    [nil refresh-after]))
-(defmethod schedule :default [inst latency]
-  {:pre [(inst? inst)]}
-  (let [lifespan (delta-t (now) inst)
-        refresh-after (- lifespan latency)
-        fresh? (not (neg? refresh-after))]
-    [(when fresh? inst) refresh-after]))
+(def capped-exponential-backoff (concat (take 16 (iterate (partial * 2) 1)) (repeat 60000)))
 
 (defn create
-  "Create an ephemeral that is be supplied by the provided `acquire` function.  Use the optional
-  `backoffs` sequence to control backoff delays when the `acquire` function reports failure.  The
-  default is exponential backoff capped at 30s.
+  "Create a channel-like ephemeral type that will be iteratively supplied
+  perishable values by invoking the provided `acquire` function.
 
-  The `acquire` function is passed the channel-like ephemeral onto which it must place a tuple
-  of [`value` `t`] where `t` informs the schedule for refreshing and optionally expiring the
-  ephemeral `value` (determined by the `schedule` multimethod).  The `acquire` function can
-  synchronously report a retryable failure by throwing an exception.  The `acquire` function
-  can asynchronously report a retryable failure by placing a value that does not satisfy
-  `sequential?` on the ephemeral channel.
+  The `acquire` function is passed the current continuation token (k) and should
+  return a non-nil value.  If acquire returns nil or throws an exception, the
+  optional `backoffs` sequence can be configured to manage delays before each
+  retry.  The default is exponential backoff capped at 60s.
 
-  If the ephemeral channel is closed all resources are freed and no further updates to the
-  ephemeral will be attempted."
-  ([acquire] (let [capped-exponential-backoff (concat (take 15 (iterate (partial * 2) 1)) (repeat 30000))]
-               (create acquire capped-exponential-backoff)))
-  ([acquire backoffs-all]
-   {:pre [(fn? acquire) (seqable? backoffs-all)]}
-   (let [out-ref (atom (async/promise-chan))
-         in (async/chan 1)
-         eph (->Ephemeral out-ref in (atom {::version 0}))]
-     ;; coordinate the out-ref promise-channel from value arriving on the in channel
-     (async/go-loop [expiry nil alarm (async/timeout 0) called-at nil backoffs backoffs-all]
-       (let [[event port] (async/alts! (filter identity [alarm in expiry]))
-             now (now)]
-         (when-let [[e a c bs] (condp = port
-                                 expiry (do (reset! out-ref (async/promise-chan))
-                                            [nil alarm called-at backoffs])
-                                 alarm (try (acquire eph)
-                                            [expiry nil now backoffs]
-                                            (catch #?(:clj java.lang.Exception :cljs js/Error) _
-                                              [expiry (async/timeout (first backoffs)) now (rest backoffs)]))
-                                 in (when event
-                                      (if (sequential? event) ; did the acquire fn provide a value tuple?
-                                        (let [[v expires-at] event
-                                              latency (delta-t called-at now)
-                                              [expire-at refresh-after] (schedule expires-at latency)
-                                              fresh? (not (neg? refresh-after))
-                                              expire-after (when (and fresh? expire-at) (delta-t now expire-at))]
-                                          (vary-meta eph #(-> %
-                                                              (merge {::acquired-at now ::expires-at expire-at ::latency latency ::anomaly nil})
-                                                              (update ::version inc)))
-                                          (when fresh?
-                                            (let [[pc pc'] (reset-vals! out-ref (async/promise-chan))]
-                                              (async/offer! pc v) ; release any previously blocked takes
-                                              (async/offer! pc' v)))
-                                          [(when expire-after (async/timeout expire-after)) (async/timeout refresh-after) nil backoffs-all])
-                                        (let [backoff (first backoffs)]
-                                          (vary-meta eph assoc ::anomaly {::reported-at now ::event event ::backoff backoff})
-                                          [expiry (async/timeout backoff) nil (rest backoffs)]))))]
-           (recur e a c bs))))
-     eph)))
+  The return value of `acquire` is interpreted by optional functions.
+
+   :vf - fn of 'ret' -> 'v', the ephemeral's acquired value, default 'identity'
+   :kf - fn of 'ret' -> 'next-k', default 'identity'
+   :ef - fn of 'ret' -> time (in ms) before value expires, default nil (never expires)
+   :rf - fn of 'ret' -> time (in ms) before value should be refreshed, default nil (never refresh)
+   :initk - the initial token value passed to `acquire`, default 'nil'
+   :backoffs - seqable of delays, in ms, default exponential backoff capped at 60s.
+
+  The ephemeral's value is available by either taking from the ephemeral as a
+  channel or dereferencing the ephemeral.  In either case, if no fresh value is
+  available, acquirers will be blocked until a value becomes available.
+
+  If `rf` is nil, the ephemeral will not pre-emptively acquire a value.
+  Instead, like a clojure delay, acquisition will only be invoked on an attempt
+  to access the ephemeral value.  This on-demand acquisition will continue even
+  if the acquired value expires.
+
+  If the ephemeral channel is closed all resources are freed and no further
+  updates to the ephemeral will be attempted."
+  [acquire & {:keys [initk kf vf ef rf backoffs]
+              :or {initk nil
+                   vf identity
+                   kf identity
+                   ef nil ; never expires
+                   rf nil ; never refreshes; trigger acquire only when unrealized value is accessed
+                   backoffs capped-exponential-backoff}}]
+  {:pre [(fn? acquire) vf kf (seqable? backoffs)]}
+  (let [out (async/chan (resettable-promise-buffer ::unrealized))
+        trigger (async/chan (async/dropping-buffer 1))
+        ef' (or ef (constantly nil))
+        rf' (or rf (constantly nil))
+        >metrics (atom {:created-at (now)
+                        :takes 0 :puts 0
+                        :takes-deferred 0
+                        :acquisitions 0
+                        :stale-acquisitions 0
+                        :fresh-acquisitions 0
+                        :expirations 0})
+        eph (->Ephemeral acquire (atom initk) kf vf ef' rf' out trigger >metrics)]
+    (async/go-loop [in nil e-alarm nil r-alarm nil called-at nil]
+      (let [[event port] (async/alts! (filter identity [in e-alarm r-alarm trigger]))
+            now (now)]
+        (if-let [[in ea ra c] (condp = port
+                                e-alarm (do (swap! >metrics #(-> %
+                                                                 (update :expirations inc)
+                                                                 (assoc :expired-at now)))
+                                            (async/put! out ::unrealized)
+                                            [in nil r-alarm called-at])
+                                trigger (when event
+                                          (if (or in (async/poll! out)) ; are we already fetching or did we just acquire a value?
+                                            [in e-alarm r-alarm called-at] ; no-op
+                                            [(insist eph backoffs >metrics) e-alarm nil now]))
+                                r-alarm [(insist eph backoffs >metrics) e-alarm nil now]
+                                in (when event
+                                     (let [[expires-in refresh-in] event]
+                                       (swap! >metrics #(-> %
+                                                            (update :acquisitions inc)
+                                                            (assoc :acquired-at now)
+                                                            (dissoc :expired-at)))
+                                       (let [latency (- now called-at)
+                                             refresh-alarm (when refresh-in
+                                                             (async/timeout (max (- refresh-in latency)
+                                                                                 (if expires-in (long (/ expires-in 2)) 0))))]
+                                         [nil (when expires-in (async/timeout expires-in)) refresh-alarm nil]))))]
+          (recur in ea ra c)
+          (swap! >metrics assoc :event-loop-closed-at now))))
+    (when rf (async/offer! trigger true))
+    eph))
 
 #?(:clj
    (do (defmethod clojure.core/print-method Ephemeral
