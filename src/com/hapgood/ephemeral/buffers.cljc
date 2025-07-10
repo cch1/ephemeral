@@ -9,7 +9,9 @@
   (remove! [_] val)
   (add!* [this item] (set! val item) this)
   (close-buf! [_] (set! val nil))
-  clojure.lang.Counted
-  (count [_] (if (= sentinel val) 0 1)))
+  #?@(:clj (clojure.lang.Counted
+            (count [_] (if (= sentinel val) 0 1)))
+      :cljs (ICounted
+             (-count [_] (if (= sentinel val) 0 1)))))
 
 (defn resettable-promise-buffer [v] (ResettablePromiseBuffer. v v))

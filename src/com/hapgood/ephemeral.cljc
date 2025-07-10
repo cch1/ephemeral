@@ -14,15 +14,15 @@
   is the return of `f`.  If `f` returns nil or throws an exception, it is
   retried after a delay (in ms) taken from `backoffs`."
   [f backoffs >metrics]
-  {:pre [(instance? clojure.lang.IFn f) (seqable? backoffs)]}
-  (swap! >metrics assoc :acquire {:started-at (now) :invoked 0 :pending 0 :failed 0 :retries 0})
-  (async/go-loop [ret nil t (async/timeout 0) backoffs backoffs]
+  {:pre [(seqable? backoffs)]}
+  (swap! >metrics assoc :acquire {:started-at (now) :invoked 1 :pending 1 :failed 0 :retries 0})
+  (async/go-loop [ret (f) t nil backoffs backoffs]
     (let [[event port] (async/alts! (filter identity [ret t]))]
       (condp = port
         t (do (swap! >metrics update :acquire #(-> %
                                                    (update :invoked inc)
                                                    (update :pending inc)))
-              (recur #?(:clj (async/thread (f)) :cljs (async/go (f))) nil backoffs))
+              (recur (f) nil backoffs))
         ret (do (swap! >metrics update-in [:acquire :pending] dec)
                 (if (some? event)
                   event
@@ -44,10 +44,6 @@
         (swap! >metrics update :takes-deferred inc)
         (async/offer! trigger true))
       ret))
-  impl/WritePort
-  (put! [this v fn1-handler]
-    (swap! >metrics update :puts inc)
-    (impl/put! out v fn1-handler))
   impl/Channel
   (close! [this]
     (swap! >metrics assoc :closed? true :closed-at (now))
@@ -55,7 +51,7 @@
     (impl/close! out))
   (closed? [this] (impl/closed? out))
   ;; Inspired by https://clojure.atlassian.net/browse/ASYNC-102
-  #?@(:clj (clojure.lang.IDeref ; This interface is semantically inappropriate for ClojureScript, right?
+  #?@(:clj (clojure.lang.IDeref
             (deref [this]
                    (let [p (promise)]
                      (async/take! this (fn [x] (deliver p x)))
@@ -67,19 +63,22 @@
                      (if (= this port) val fallback)))
             clojure.lang.IPending
             (isRealized [this] (boolean (async/poll! this)))))
-  clojure.lang.IFn
-  (invoke [this] (try (when-some [result (acquire @>k)]
-                        (let [[k v e r] ((juxt kf vf ef rf) result)]
-                          (reset! >k k)
-                          (if (and v ((some-fn nil? pos?) e)) ; fresh?
-                            (do (swap! >metrics update :fresh-acquisitions inc)
-                                (async/put! this v)
-                                [e r])
-                            (do (swap! >metrics update :stale-acquisitions inc)
-                                [nil 0]))))
-                      (catch Exception e
-                        (swap! >metrics assoc :last-acquisition-exception e)
-                        nil)))
+  #?(:clj clojure.lang.IFn :cljs IFn)
+  (#?(:clj invoke :cljs -invoke)
+    [this] (async/go
+             (when-some [result (async/<! (acquire @>k))]
+               (try (let [[k v e r] ((juxt kf vf ef rf) result)]
+                      (reset! >k k)
+                      (if (and v ((some-fn nil? pos?) e)) ; fresh?
+                        (do (swap! >metrics update :fresh-acquisitions inc)
+                            (async/put! out v)
+                            [e r])
+                        (do (swap! >metrics update :stale-acquisitions inc)
+                            [nil 0])))
+                    (catch #?(:clj Exception :cljs js/Error) e
+                      (swap! >metrics assoc :last-acquisition-exception e)
+                      nil)))))
+
   Stateful
   (inspect [this] [@>k @>metrics (async/poll! this) (impl/closed? out)])
   Object
@@ -87,7 +86,9 @@
                      (str "#<Ephemeral " (pr-str v) ">")
                      "#<Ephemeral >")))
 
-(def capped-exponential-backoff (concat (take 16 (iterate (partial * 2) 1)) (repeat 60000)))
+(def capped-exponential-backoff
+  "A infinite exponentially increasing sequence of integers capped at 60000"
+  (concat (take 16 (iterate (partial * 2) 1)) (repeat 60000)))
 
 (defn create
   "Create a channel-like ephemeral type that will be iteratively supplied
@@ -96,25 +97,29 @@
   The `acquire` function is passed the current continuation token (k) and should
   return a non-nil value.  If acquire returns nil or throws an exception, the
   optional `backoffs` sequence can be configured to manage delays before each
-  retry.  The default is exponential backoff capped at 60s.
+  retry.  The default is an infinite exponential backoff capped at 60s.
 
-  The return value of `acquire` is interpreted by optional functions.
+  The return value of `acquire`, 'ret', is interpreted by optional functions.
 
    :vf - fn of 'ret' -> 'v', the ephemeral's acquired value, default 'identity'
    :kf - fn of 'ret' -> 'next-k', default 'identity'
    :ef - fn of 'ret' -> time (in ms) before value expires, default nil (never expires)
    :rf - fn of 'ret' -> time (in ms) before value should be refreshed, default nil (never refresh)
+
+  Other options are:
+
    :initk - the initial token value passed to `acquire`, default 'nil'
    :backoffs - seqable of delays, in ms, default exponential backoff capped at 60s.
 
   The ephemeral's value is available by either taking from the ephemeral as a
-  channel or dereferencing the ephemeral.  In either case, if no fresh value is
-  available, acquirers will be blocked until a value becomes available.
+  channel or dereferencing the ephemeral (Clojure-only).  In either case, if no
+  fresh value is available, acquirers will be blocked until a fresh value is
+  acquired.
 
-  If `rf` is nil, the ephemeral will not pre-emptively acquire a value.
-  Instead, like a clojure delay, acquisition will only be invoked on an attempt
-  to access the ephemeral value.  This on-demand acquisition will continue even
-  if the acquired value expires.
+  If `rf` is nil, the ephemeral will not pre-emptively acquire a value upon
+  creation.  Instead, like a clojure delay, acquisition will only be triggered
+  by attempts to access the ephemeral value.  This on-demand acquisition will
+  repeat if the acquired value expires.
 
   If the ephemeral channel is closed all resources are freed and no further
   updates to the ephemeral will be attempted."
