@@ -66,18 +66,20 @@
   #?(:clj clojure.lang.IFn :cljs IFn)
   (#?(:clj invoke :cljs -invoke)
     [this] (async/go
-             (when-some [result (async/<! (acquire @>k))]
-               (try (let [[k v e r] ((juxt kf vf ef rf) result)]
-                      (reset! >k k)
-                      (if (and v ((some-fn nil? pos?) e)) ; fresh?
-                        (do (swap! >metrics update :fresh-acquisitions inc)
-                            (async/put! out v)
-                            [e r])
-                        (do (swap! >metrics update :stale-acquisitions inc)
-                            [nil 0])))
-                    (catch #?(:clj Exception :cljs js/Error) e
-                      (swap! >metrics assoc :last-acquisition-exception e)
-                      nil)))))
+             (let [c (async/chan)]
+               (acquire @>k c)
+               (if-some [result (async/<! c)]
+                 (try (let [[k v e r] ((juxt kf vf ef rf) result)]
+                        (reset! >k k)
+                        (if (and v ((some-fn nil? pos?) e)) ; fresh?
+                          (do (swap! >metrics update :fresh-acquisitions inc)
+                              (async/put! out v)
+                              [e r])
+                          (do (swap! >metrics update :stale-acquisitions inc)
+                              [nil 0])))
+                      (catch #?(:clj Exception :cljs js/Error) e
+                        (swap! >metrics assoc :last-acquisition-exception e)
+                        nil))))))
 
   Stateful
   (inspect [this] [@>k @>metrics (async/poll! this) (impl/closed? out)])

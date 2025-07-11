@@ -6,15 +6,12 @@
 
 (defn- now [] #?(:clj (System/currentTimeMillis) :cljs (inst-ms (js/Date.))))
 
-(defn producer
-  [k]
-  (let [c (async/chan)] (async/put! c (inc (or k -1))) c))
+(defn producer [k c] (async/put! c (inc (or k -1))))
 
 (defn lazy-producer
   [n]
-  (fn [k]
-    (async/go (async/<! (async/timeout n))
-              (async/<! (producer k)))))
+  (fn [k c]
+    (async/take! (async/timeout n) (fn [_] (producer k c)))))
 
 #_(deftest fail-you
     (is false "Expected test failure."))
@@ -68,7 +65,7 @@
              (closing [e (create producer :initk 0 :vf (partial * 2))]
                (is (= 2 (async/<! e)))))
            (testing "kf"
-             (closing [e (create (fn [k] (async/go {:k (inc k)}))
+             (closing [e (create (fn [k c] (async/put! c {:k (inc k)}))
                                  :initk -1 :kf :k :backoffs nil)]
                (is (= {:k 0} (async/<! e)))))))
 
@@ -87,7 +84,7 @@
             (is (nil? (deref e))))))
 
 (deftest refreshes-non-expiring-values
-  (go-test (closing [e (create (fn [k] (let [k' (inc k)] (async/go [k' (if (< k' 2) 1 1000)]))) ; short short long
+  (go-test (closing [e (create (fn [k c] (let [k' (inc k)] (async/put! c [k' (if (< k' 2) 1 1000)]))) ; short short long
                                :vf first :initk -1 :kf first :ef (constantly nil) :rf second :backoffs nil)]
              (async/<! (async/timeout 20))
              (is (= 2 (async/<! e)))
@@ -104,14 +101,14 @@
 
 (deftest pre-expired-values-trigger-acquire ; without unblocking consumers...
   (go-test (closing [e (create (let [lifetimes (concat (repeat 4 -1) (repeat 5 10000))] ; supply four stale values before supplying a fresh value
-                                 (fn [k] (async/go [(inc k) (nth lifetimes (inc k))])))
+                                 (fn [k c] (async/put! c [(inc k) (nth lifetimes (inc k))])))
                                :vf first :initk -1 :kf first :ef second :rf second :backoffs nil)]
              (is (= 4 (async/<! e))))))
 
 (deftest exceptions-supplying-value-are-handled
-  (go-test (closing [e (create (fn [k]
-                                 (async/go #?(:clj (throw (ex-info "Boom!!" {}))
-                                              :cljs nil)))
+  (go-test (closing [e (create (fn [k c]
+                                 (async/put! c #?(:clj (throw (ex-info "Boom!!" {}))
+                                                  :cljs nil)))
                                :backoffs nil)]
              (async/take! e (fn [& _])) ; no-op take triggers acquisition
              (async/<! (async/timeout 100))
@@ -123,11 +120,11 @@
 
 (deftest exceptions-supplying-value-are-caught-and-retried
   (go-test (closing [e (create (let [state (atom -4)] ; fail three times and then supply a value
-                                 (fn [k]
-                                   (async/go (if (neg? (swap! state inc))
-                                               #?(:clj (throw (ex-info "Boom" {}))
-                                                  :cljs nil)
-                                               [@state 100]))))
+                                 (fn [k c]
+                                   (async/put! c (if (neg? (swap! state inc))
+                                                   #?(:clj (throw (ex-info "Boom" {}))
+                                                      :cljs nil)
+                                                   [@state 100]))))
                                :vf first)]
              (is (zero? (async/<! e))))))
 
