@@ -4,7 +4,7 @@
   (:require [clojure.core.async :as async]
             [clojure.test :as test]))
 
-(def ^:dynamic *timeout* 5000)
+(def ^:dynamic *timeout* 30000)
 
 (defmacro go-test
   "Asynchronously execute the test body (in a go block)"

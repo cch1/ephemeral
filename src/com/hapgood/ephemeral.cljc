@@ -2,10 +2,11 @@
   (:require [clojure.pprint]
             [clojure.core.async :as async]
             [clojure.core.async.impl.protocols :as impl]
+            [com.hapgood.ephemeral.insist :as-alias insist]
             [com.hapgood.ephemeral.buffers :refer [resettable-promise-buffer]]))
 
-(defprotocol Stateful
-  (inspect [this] "Return the state of this."))
+(defprotocol Eventful
+  (events [this] "Return the channel in which events related to this are reported."))
 
 (defn- now [] #?(:clj (System/currentTimeMillis) :cljs (inst-ms (js/Date.))))
 
@@ -13,41 +14,41 @@
   "Resiliently evaluate the function `f`.  Returns a channel whose only value
   is the return of `f`.  If `f` returns nil or throws an exception, it is
   retried after a delay (in ms) taken from `backoffs`."
-  [f backoffs >metrics]
+  [f backoffs =events]
   {:pre [(seqable? backoffs)]}
-  (swap! >metrics assoc :acquire {:started-at (now) :invoked 1 :pending 1 :failed 0 :retries 0})
+  (async/put! =events [::insist/started])
+  (async/put! =events [::insist/wait-starting])
   (async/go-loop [ret (f) t nil backoffs backoffs]
     (let [[event port] (async/alts! (filter identity [ret t]))]
       (condp = port
-        t (do (swap! >metrics update :acquire #(-> %
-                                                   (update :invoked inc)
-                                                   (update :pending inc)))
+        t (do (async/put! =events [::insist/backoff-ended])
+              (async/put! =events [::insist/wait-starting])
               (recur (f) nil backoffs))
-        ret (do (swap! >metrics update-in [:acquire :pending] dec)
+        ret (do (async/put! =events [::insist/wait-ended])
                 (if (some? event)
-                  event
-                  (do (swap! >metrics update-in [:acquire :failed] inc)
-                      (when-let [backoff (first backoffs)]
-                        (swap! >metrics update :acquire #(-> %
-                                                             (update :retries inc)
-                                                             (assoc :last-backoff backoff)))
-                        (recur nil (async/timeout backoff) (rest backoffs))))))))))
+                  (do (async/put! =events [::insist/ended])
+                      event)
+                  (if-let [backoff (first backoffs)]
+                    (do (async/put! =events [::insist/backoff-starting {:backoff backoff}])
+                        (recur nil (async/timeout backoff) (rest backoffs)))
+                    (do (async/put! =events [::insist/ended])
+                        nil))))))))
 
 ;; A channel-like type that coordinates the supply of fresh ephemeral values.
 ;; TODO: https://blog.klipse.tech/clojurescript/2016/04/26/deftype-explained.html
-(deftype Ephemeral [acquire >k kf vf ef rf out trigger >metrics]
+(deftype Ephemeral [acquire >k kf vf ef rf out trigger events]
   impl/ReadPort
   (take! [this fn1-handler]
-    (swap! >metrics update :takes inc)
+    (async/put! events [::take])
     (let [ret (impl/take! out fn1-handler)] ; ret is nil if take was enqueued
       (when (nil? ret)
-        (swap! >metrics update :takes-deferred inc)
+        (async/put! events [::take-deferred])
         (async/offer! trigger true))
       ret))
   impl/Channel
   (close! [this]
-    (swap! >metrics assoc :closed? true :closed-at (now))
     (async/close! trigger)
+    (async/put! events [::closed])
     (impl/close! out))
   (closed? [this] (impl/closed? out))
   ;; Inspired by https://clojure.atlassian.net/browse/ASYNC-102
@@ -65,24 +66,24 @@
             (isRealized [this] (boolean (async/poll! this)))))
   #?(:clj clojure.lang.IFn :cljs IFn)
   (#?(:clj invoke :cljs -invoke)
-    [this] (async/go
-             (let [c (async/chan)]
-               (acquire @>k c)
-               (if-some [result (async/<! c)]
-                 (try (let [[k v e r] ((juxt kf vf ef rf) result)]
-                        (reset! >k k)
-                        (if (and v ((some-fn nil? pos?) e)) ; fresh?
-                          (do (swap! >metrics update :fresh-acquisitions inc)
-                              (async/put! out v)
-                              [e r])
-                          (do (swap! >metrics update :stale-acquisitions inc)
-                              [nil 0])))
-                      (catch #?(:clj Exception :cljs js/Error) e
-                        (swap! >metrics assoc :last-acquisition-exception e)
-                        nil))))))
-
-  Stateful
-  (inspect [this] [@>k @>metrics (async/poll! this) (impl/closed? out)])
+    [this] (async/go (try
+                       (let [c (async/chan)]
+                         (acquire @>k c)
+                         (when-some [result (async/<! c)]
+                           (let [[k v e r :as x] ((juxt kf vf ef rf) result)]
+                             (async/put! events [::acquisition])
+                             (reset! >k k)
+                             (if (and v ((some-fn nil? pos?) e)) ; fresh?
+                               (do (async/put! events [::fresh-acquisition])
+                                   (async/put! out v)
+                                   [e r])
+                               (do (async/put! events [::stale-acquisition])
+                                   [nil 0])))))
+                       (catch #?(:clj Exception :cljs js/Error) e
+                         (async/put! events [::acquisition-exception {:exception e}])
+                         nil))))
+  Eventful
+  (events [this] events)
   Object
   (toString [this] (if-let [v (async/poll! this)]
                      (str "#<Ephemeral " (pr-str v) ">")
@@ -137,41 +138,32 @@
         trigger (async/chan (async/dropping-buffer 1))
         ef' (or ef (constantly nil))
         rf' (or rf (constantly nil))
-        >metrics (atom {:created-at (now)
-                        :takes 0 :puts 0
-                        :takes-deferred 0
-                        :acquisitions 0
-                        :stale-acquisitions 0
-                        :fresh-acquisitions 0
-                        :expirations 0})
-        eph (->Ephemeral acquire (atom initk) kf vf ef' rf' out trigger >metrics)]
+        events (async/chan (async/sliding-buffer 20))
+        >k (atom initk)
+        eph (->Ephemeral acquire >k kf vf ef' rf' out trigger events)]
+    (async/put! events [::event-loop-starting])
     (async/go-loop [in nil e-alarm nil r-alarm nil called-at nil]
       (let [[event port] (async/alts! (filter identity [in e-alarm r-alarm trigger]))
             now (now)]
         (if-let [[in ea ra c] (condp = port
-                                e-alarm (do (swap! >metrics #(-> %
-                                                                 (update :expirations inc)
-                                                                 (assoc :expired-at now)))
+                                e-alarm (do (async/put! events [::expiration])
                                             (async/put! out ::unrealized)
                                             [in nil r-alarm called-at])
                                 trigger (when event
                                           (if (or in (async/poll! out)) ; are we already fetching or did we just acquire a value?
                                             [in e-alarm r-alarm called-at] ; no-op
-                                            [(insist eph backoffs >metrics) e-alarm nil now]))
-                                r-alarm [(insist eph backoffs >metrics) e-alarm nil now]
+                                            [(insist eph backoffs events) e-alarm nil now]))
+                                r-alarm [(insist eph backoffs events) e-alarm nil now]
                                 in (when event
                                      (let [[expires-in refresh-in] event]
-                                       (swap! >metrics #(-> %
-                                                            (update :acquisitions inc)
-                                                            (assoc :acquired-at now)
-                                                            (dissoc :expired-at)))
                                        (let [latency (- now called-at)
                                              refresh-alarm (when refresh-in
                                                              (async/timeout (max (- refresh-in latency)
                                                                                  (if expires-in (long (/ expires-in 2)) 0))))]
                                          [nil (when expires-in (async/timeout expires-in)) refresh-alarm nil]))))]
           (recur in ea ra c)
-          (swap! >metrics assoc :event-loop-closed-at now))))
+          (do (async/put! events [::event-loop-closed {:k @>k}])
+              (async/close! events)))))
     (when rf (async/offer! trigger true))
     eph))
 
@@ -187,3 +179,33 @@
      Ephemeral
      (-pr-writer [this writer opts]
        (-write writer (.toString this)))))
+
+(defn summarize-events
+  "Summarize the events emitted by the given ephemeral `eph`.  Note that only
+  buffered and future events will be summarized.  Returns a channel that will
+  contain the single event summary once `eph` is closed.
+
+  NB: this function is not suitable for monitoring an ephemeral in production
+  since the summary channel is only available after the ephemeral has shut down."
+  [eph]
+  (let [initial-summary {::acquisition 0
+                         ::expiration 0
+                         ::take 0}
+        summarizer (fn summarizer [summary [event data]]
+                     (let [summary (update summary event (fnil inc 0))]
+                       (case event
+                         ::acquisition-exception (assoc summary ::last-acquisition-exception (:exception data))
+                         ::event-loop-closed (assoc summary ::final-k (:k data))
+                         ::insist/backoff-starting (let [{:keys [backoff]} data]
+                                                     (-> summary
+                                                         (assoc ::insist/current-backoff backoff)
+                                                         (update ::insist/backoff-accumulated (fnil + 0) backoff)
+                                                         (update ::insist/total-backoff-accumulated (fnil + 0) backoff)))
+                         (::insist/started
+                          ::insist/ended) (-> summary
+                                              (update ::insist/pending? not)
+                                              (dissoc ::insist/current-backoff ::insist/backoff-accumulated))
+                         (::insist/wait-starting
+                          ::insist/wait-ended) (update summary ::insist/waiting? not)
+                         summary)))]
+    (async/reduce summarizer initial-summary (events eph))))

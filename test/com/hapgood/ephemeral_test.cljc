@@ -1,8 +1,10 @@
 (ns com.hapgood.ephemeral-test
-  (:require [com.hapgood.ephemeral :as uat :refer [create inspect] :include-macros true]
+  (:require [com.hapgood.ephemeral :as uat :refer [create summarize-events events] :include-macros true]
+            [com.hapgood.ephemeral.insist :as-alias insist]
             [clojure.core.async :as async]
             [clojure.test :refer [deftest is testing #?(:cljs async)]]
-            [com.hapgood.test-utilities :refer [go-test closing] :include-macros true]))
+            [com.hapgood.test-utilities :refer [go-test closing] :include-macros true])
+  (:import #?(:clj (clojure.lang ExceptionInfo) :cljs (cljs.core/ExceptionInfo))))
 
 (defn- now [] #?(:clj (System/currentTimeMillis) :cljs (inst-ms (js/Date.))))
 
@@ -23,39 +25,48 @@
     (go-test (async/<! (async/timeout 10000)) (is true "WTF")))
 
 (deftest instrumented
-  (go-test (closing [e (create producer)]
-             (let [[k metrics] (inspect e)]
-               (is (map? metrics))))))
+  (go-test (closing [e (create producer)
+                     c (events e)]
+             (async/close! e)
+             (is (= #{[::uat/event-loop-starting]
+                      [::uat/closed]
+                      [::uat/event-loop-closed {:k nil}]} (async/<! (async/into #{} c)))))))
 
 (deftest unavailable-ephemeral-cannot-be-captured
   (go-test (let [latency 100]
-             (closing [e (create (lazy-producer latency))]
+             (closing [e (create (lazy-producer latency))
+                       =metrics (summarize-events e)]
                (is (nil? (first (async/alts! [e (async/timeout (/ latency 2))]))))
-               (let [[_ {:keys [takes-deferred]}] (inspect e)]
-                 (is (= 1 takes-deferred)))))))
+               (async/close! e)
+               (let [{::uat/keys [take-deferred] :as m} (async/<! =metrics)]
+                 (is (= 1 take-deferred)))))))
 
 (deftest ephemeral-blocks-until-available-for-capture
   (go-test (let [start (now)
                  latency 100]
-             (closing [e (create (lazy-producer latency))]
+             (closing [e (create (lazy-producer latency))
+                       =metrics (summarize-events e)]
                (is (zero? (async/<! e)))
                (is (<= latency (- (now) start))) ; required more than latency to acquire
-               (let [[_ {:keys [takes fresh-acquisitions] :as m}] (inspect e)]
-                 (is (= 1 fresh-acquisitions))
-                 (is (= 1 takes)))))))
+               (async/close! e)
+               (let [{::uat/keys [take fresh-acquisition] :as m} (async/<! =metrics)]
+                 (is (= 1 fresh-acquisition))
+                 (is (= 1 take)))))))
 
 (deftest can-expire
   (go-test (let [lifetime 10
                  latency 100]
-             (closing [e (create (lazy-producer latency) :initk -1 :ef (constantly lifetime))]
+             (closing [e (create (lazy-producer latency) :initk -1 :ef (constantly lifetime))
+                       =metrics (summarize-events e)]
                (is (zero? (async/<! e))) ; blocks; access triggers acquisition
                (async/<! (async/timeout (* 5 lifetime))) ; wait for the value to expire...
                (is (nil? (async/poll! e))) ; maybe access triggers acquisition
                (is (pos-int? (async/<! e))) ; blocks; access triggers acquisition
-               (let [[_ {:keys [takes fresh-acquisitions expirations] :as m}] (inspect e)]
-                 (is (pos-int? expirations))
-                 (is (pos-int? fresh-acquisitions))
-                 (is (= 3 takes)))))))
+               (async/close! e)
+               (let [{::uat/keys [take fresh-acquisition expiration] :as m} (async/<! =metrics)]
+                 (is (pos-int? expiration))
+                 (is (pos-int? fresh-acquisition))
+                 (is (= 3 take)))))))
 
 (deftest ephemeral-options
   (go-test (testing "initk"
@@ -73,25 +84,29 @@
           (closing [e (create producer :initk -1 :backoffs nil)]
             (is (zero? (deref e))))
           (let [latency 100]
-            (closing [e (create (lazy-producer latency) :initk -1 :backoffs nil)]
+            (closing [e (create (lazy-producer latency) :initk -1 :backoffs nil)
+                      =metrics (summarize-events e)]
               (is (= :timeout (deref e (/ latency 2) :timeout)))
               (is (zero? (deref e (* 2 latency) :timeout)))
-              (let [[_ {:keys [takes fresh-acquisitions expirations] :as m}] (inspect e)]
-                (is (pos-int? fresh-acquisitions))
-                (is (= 2 takes)))))
+              (async/close! e)
+              (let [{::uat/keys [take fresh-acquisition] :as m} (async/<!! =metrics)]
+                (is (pos-int? fresh-acquisition))
+                (is (= 2 take)))))
           (let [e (create producer :initk -1 :backoffs nil)]
             (async/close! e)
             (is (nil? (deref e))))))
 
 (deftest refreshes-non-expiring-values
   (go-test (closing [e (create (fn [k c] (let [k' (inc k)] (async/put! c [k' (if (< k' 2) 1 1000)]))) ; short short long
-                               :vf first :initk -1 :kf first :ef (constantly nil) :rf second :backoffs nil)]
+                               :vf first :initk -1 :kf first :ef (constantly nil) :rf second :backoffs nil)
+                     =metrics (summarize-events e)]
              (async/<! (async/timeout 20))
              (is (= 2 (async/<! e)))
-             (let [[_ {:keys [takes fresh-acquisitions expirations] :as m}] (inspect e)]
-               (is (pos-int? fresh-acquisitions))
-               (is (zero? expirations))
-               (is (= 1 takes))))))
+             (async/close! e)
+             (let [{::uat/keys [take fresh-acquisition expiration] :as m} (async/<! =metrics)]
+               (is (pos-int? fresh-acquisition))
+               (is (zero? expiration))
+               (is (= 1 take))))))
 
 (deftest supports-acquire-on-access-mode
   (go-test (closing [e (create (lazy-producer 10)
@@ -99,34 +114,49 @@
              (async/<! (async/timeout 100))
              (is (zero? (async/<! e))))))
 
-(deftest pre-expired-values-trigger-acquire ; without unblocking consumers...
-  (go-test (closing [e (create (let [lifetimes (concat (repeat 4 -1) (repeat 5 10000))] ; supply four stale values before supplying a fresh value
+(deftest stale-values-re-trigger-acquire ; without unblocking consumers...
+  (go-test (closing [e (create (let [lifetimes (concat [-1 -1] (repeat 5 10000))] ; supply two stale values before supplying a fresh value
                                  (fn [k c] (async/put! c [(inc k) (nth lifetimes (inc k))])))
-                               :vf first :initk -1 :kf first :ef second :rf second :backoffs nil)]
-             (is (= 4 (async/<! e))))))
+                               :vf first :initk -1 :kf first :ef second :rf second :backoffs nil)
+                     =metrics (summarize-events e)]
+             (is (= 2 (async/<! e)))
+             (async/close! e)
+             (let [{::uat/keys [take fresh-acquisition stale-acquisition] :as m} (async/<! =metrics)]
+               (is (= 1 fresh-acquisition))
+               (is (= 2 stale-acquisition))
+               (is (= 1 take))))))
 
 (deftest exceptions-supplying-value-are-handled
-  (go-test (closing [e (create (fn [k c]
-                                 (async/put! c #?(:clj (throw (ex-info "Boom!!" {}))
-                                                  :cljs nil)))
-                               :backoffs nil)]
+  (go-test (closing [e (create (fn [k c] (throw (ex-info "Boom!!" {})))
+                               :backoffs nil)
+                     =metrics (summarize-events e)]
              (async/take! e (fn [& _])) ; no-op take triggers acquisition
              (async/<! (async/timeout 100))
-             (let [[_ {:keys [acquisitions] {:keys [invoked failed retries]} :acquire :as m}] (inspect e)]
-               (is (zero? acquisitions))
-               (is (= 1 invoked))
-               (is (= 1 failed))
-               (is (zero? retries))))))
+             (async/close! e)
+             (let [{::uat/keys [acquisition acquisition-exception last-acquisition-exception] :as m} (async/<! =metrics)]
+               (is (zero? acquisition))
+               (is (= 1 acquisition-exception))
+               (is (instance? ExceptionInfo last-acquisition-exception))))))
 
 (deftest exceptions-supplying-value-are-caught-and-retried
   (go-test (closing [e (create (let [state (atom -4)] ; fail three times and then supply a value
                                  (fn [k c]
-                                   (async/put! c (if (neg? (swap! state inc))
-                                                   #?(:clj (throw (ex-info "Boom" {}))
-                                                      :cljs nil)
-                                                   [@state 100]))))
-                               :vf first)]
-             (is (zero? (async/<! e))))))
+                                   (if (neg? (swap! state inc))
+                                     (throw (ex-info "Boom" {}))
+                                     (async/put! c [@state 100]))))
+                               :vf first)
+                     =metrics (summarize-events e)]
+             (is (zero? (async/<! e)))
+             (async/<! (async/timeout 100))
+             (async/close! e)
+             (let [{::uat/keys [acquisition acquisition-exception last-acquisition-exception]
+                    ::insist/keys [current-backoff backoff-accumulated total-backoff-accumulated] :as m} (async/<! =metrics)]
+               (is (nil? current-backoff))
+               (is (nil? backoff-accumulated))
+               (is (= (+ 1 2 4) total-backoff-accumulated))
+               (is (= 1 acquisition))
+               (is (= 3 acquisition-exception))
+               (is (instance? ExceptionInfo last-acquisition-exception))))))
 
 (deftest pending-async-captures-are-released-when-source-closes
   (go-test (closing [e (create (lazy-producer 10000) :initk -1 :rf nil)]
