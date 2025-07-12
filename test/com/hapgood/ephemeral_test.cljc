@@ -15,15 +15,6 @@
   (fn [k c]
     (async/take! (async/timeout n) (fn [_] (producer k c)))))
 
-#_(deftest fail-you
-    (is false "Expected test failure."))
-
-#_(deftest fail-you-async
-    (go-test (is false "Expected test failure.")))
-
-#_(deftest timeout-you-async
-    (go-test (async/<! (async/timeout 10000)) (is true "WTF")))
-
 (deftest instrumented
   (go-test (closing [e (create producer)
                      c (events e)]
@@ -180,15 +171,6 @@
   (go-test (closing [e (create (lazy-producer 10000) :initk -1 :rf nil)]
              (async/close! e)
              (is (nil? (async/<! e))))))
-
-(deftest acquire-fn-can-report-failure
-  #_(go-test (closing [e (create (let [state (atom -5)]
-                                   (fn [k] (if (zero? (swap! state inc))
-                                             [@state 1000]
-                                             ::unavailable)))
-                                 HERE
-                                 :somef sequential? :backoffs nil)]
-               (is (zero? (async/<! e))))))
 
 (deftest string-representation
   (closing [e (create producer :initk -1)]
