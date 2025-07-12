@@ -158,6 +158,24 @@
                (is (= 3 acquisition-exception))
                (is (instance? ExceptionInfo last-acquisition-exception))))))
 
+(deftest closed-channel-signal-failure-and-are-retried
+  (go-test (closing [e (create (let [state (atom -4)] ; fail three times and then supply a value
+                                 (fn [k c]
+                                   (if (neg? (swap! state inc))
+                                     (async/close! c)
+                                     (async/put! c [@state 100]))))
+                               :vf first)
+                     =metrics (summarize-events e)]
+             (is (zero? (async/<! e)))
+             (async/<! (async/timeout 100))
+             (async/close! e)
+             (let [{::uat/keys [acquisition acquisition-exception]
+                    ::insist/keys [current-backoff backoff-accumulated total-backoff-accumulated] :as m} (async/<! =metrics)]
+               (is (nil? current-backoff))
+               (is (nil? backoff-accumulated))
+               (is (= (+ 1 2 4) total-backoff-accumulated))
+               (is (= 1 acquisition))))))
+
 (deftest pending-async-captures-are-released-when-source-closes
   (go-test (closing [e (create (lazy-producer 10000) :initk -1 :rf nil)]
              (async/close! e)
