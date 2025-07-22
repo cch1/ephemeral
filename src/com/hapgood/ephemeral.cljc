@@ -70,7 +70,7 @@
     [this] (async/go (try
                        (if-some [result (async/<! (acquire @>k))]
                          (let [[k v e r :as x] ((juxt kf vf ef rf) result)]
-                           (async/put! events [::acquisition])
+                           (async/put! events [::acquisition {:e e :r r}])
                            (reset! >k k)
                            (if (and v ((some-fn nil? pos?) e)) ; fresh?
                              (do (async/put! events [::fresh-acquisition])
