@@ -31,7 +31,8 @@
                   (if-let [backoff (first backoffs)]
                     (do (async/put! =events [::insist/backoff-starting {:backoff backoff}])
                         (recur nil (async/timeout backoff) (rest backoffs)))
-                    (do (async/put! =events [::insist/ended])
+                    (do (async/put! =events [::insist/backoffs-exhausted])
+                        (async/put! =events [::insist/ended])
                         nil))))))))
 
 ;; A channel-like type that coordinates the supply of fresh ephemeral values.
