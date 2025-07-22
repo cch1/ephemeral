@@ -8,7 +8,7 @@ While this library is designed for values that "hard" expire (like OAuth tokens)
 In Clojure only, it is also possible to dereference the ephemeral to obtain the current (fresh) value.  If no fresh value is available, dereferencing will block.
 
 ### The acquire function
-The user-supplied `acquire` function is responsible for periodically supplying the ephemeral with fresh values.  It is called with a two parameters: a caller-managed key and a channel.  The function should put a fresh value on the channel.  The ephemeral coordinates the calling of the acquire function based on observed latency and the expiration of the current value.  If the acquire function throws synchronously it will be retried after a suitable backoff delay.  The acquire function can also asynchronously signal a failure by closing the channel.  The function will again be retried after a suitable backoff delay.
+The user-supplied `acquire` function is responsible for periodically supplying the ephemeral with fresh values.  It is called with a caller-managed key and should return a channel that will eventually receive a fresh value.  The ephemeral coordinates the calling of the acquire function based on observed latency and the expiration of the current value.  If the acquire function throws synchronously it will be retried after a suitable backoff delay.  The acquire function can also asynchronously signal a failure by closing the channel.  The function will again be retried after a suitable backoff delay.
 
 The acquired value itself is opaque to the ephemeral code, but it is the source of critical information: the value made available to consuming callers; the key value retained for the next iteration of acquire; the delay value (in milliseconds) before the value has expired; and the delay value (in milliseconds) before the next acquire invocation should be initiated.  These four interpretations of the opaque value returned by the acquire function are performed by optional functions provided when the ephemeral is created.  This mirrors the behavior of [Clojure's iteration function](https://clojuredocs.org/clojure.core/iteration).
 
@@ -41,13 +41,15 @@ The ephemeral pattern is well-suited for managing the fresh supply of expiring c
 (require '[com.hapgood.ephemeral :as ephemeral])
 
 (defn acquire
-  [k c]
-  (http/get token-server-url
-            {:body (construct-request-body k)
-             :on-success (fn [response]
-                           (let [token (extract-token response)]
-			     (async/put! c token)))
-	     :on-failure (fn [] (async/close! c))}))
+  [k]
+  (let [c (async/chan)]
+    (http/get token-server-url
+              {:body (construct-request-body k)
+               :on-success (fn [response]
+                             (let [token (extract-token response)]
+			       (async/put! c token)))
+	       :on-failure (fn [] (async/close! c))})
+    c))
 
 (def e (ephemeral/create acquire
                          :initk shared-secret :kf :refresh-token

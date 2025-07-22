@@ -68,18 +68,18 @@
   #?(:clj clojure.lang.IFn :cljs IFn)
   (#?(:clj invoke :cljs -invoke)
     [this] (async/go (try
-                       (let [c (async/chan)]
-                         (acquire @>k c)
-                         (when-some [result (async/<! c)]
-                           (let [[k v e r :as x] ((juxt kf vf ef rf) result)]
-                             (async/put! events [::acquisition])
-                             (reset! >k k)
-                             (if (and v ((some-fn nil? pos?) e)) ; fresh?
-                               (do (async/put! events [::fresh-acquisition])
-                                   (async/put! out v)
-                                   [e r])
-                               (do (async/put! events [::stale-acquisition])
-                                   [nil 0])))))
+                       (if-some [result (async/<! (acquire @>k))]
+                         (let [[k v e r :as x] ((juxt kf vf ef rf) result)]
+                           (async/put! events [::acquisition])
+                           (reset! >k k)
+                           (if (and v ((some-fn nil? pos?) e)) ; fresh?
+                             (do (async/put! events [::fresh-acquisition])
+                                 (async/put! out v)
+                                 [e r])
+                             (do (async/put! events [::stale-acquisition])
+                                 [nil 0])))
+                         (do (async/put! events [::failed-acquisition])
+                             nil))
                        (catch #?(:clj Exception :cljs js/Error) e
                          (async/put! events [::acquisition-exception {:exception e}])
                          nil))))

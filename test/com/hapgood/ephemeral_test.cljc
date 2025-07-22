@@ -8,12 +8,13 @@
 
 (defn- now [] #?(:clj (System/currentTimeMillis) :cljs (inst-ms (js/Date.))))
 
-(defn producer [k c] (async/put! c (inc (or k -1))))
+(defn producer [k] (async/go (inc (or k -1))))
 
 (defn lazy-producer
   [n]
-  (fn [k c]
-    (async/take! (async/timeout n) (fn [_] (producer k c)))))
+  (fn [k]
+    (async/go (async/<! (async/timeout n))
+              (async/<! (producer k)))))
 
 (deftest instrumented
   (go-test (closing [e (create producer)
@@ -67,7 +68,7 @@
              (closing [e (create producer :initk 0 :vf (partial * 2))]
                (is (= 2 (async/<! e)))))
            (testing "kf"
-             (closing [e (create (fn [k c] (async/put! c {:k (inc k)}))
+             (closing [e (create (fn [k] (async/go {:k (inc k)}))
                                  :initk -1 :kf :k :backoffs nil)]
                (is (= {:k 0} (async/<! e)))))))
 
@@ -88,7 +89,7 @@
             (is (nil? (deref e))))))
 
 (deftest refreshes-non-expiring-values
-  (go-test (closing [e (create (fn [k c] (let [k' (inc k)] (async/put! c [k' (if (< k' 2) 1 1000)]))) ; short short long
+  (go-test (closing [e (create (fn [k] (async/go (let [k' (inc k)] [k' (if (< k' 2) 1 1000)]))) ; short short long
                                :vf first :initk -1 :kf first :ef (constantly nil) :rf second :backoffs nil)
                      =metrics (summarize-events e)]
              (async/<! (async/timeout 20))
@@ -107,7 +108,7 @@
 
 (deftest stale-values-re-trigger-acquire ; without unblocking consumers...
   (go-test (closing [e (create (let [lifetimes (concat [-1 -1] (repeat 5 10000))] ; supply two stale values before supplying a fresh value
-                                 (fn [k c] (async/put! c [(inc k) (nth lifetimes (inc k))])))
+                                 (fn [k] (async/go [(inc k) (nth lifetimes (inc k))])))
                                :vf first :initk -1 :kf first :ef second :rf second :backoffs nil)
                      =metrics (summarize-events e)]
              (is (= 2 (async/<! e)))
@@ -118,7 +119,7 @@
                (is (= 1 take))))))
 
 (deftest exceptions-supplying-value-are-handled
-  (go-test (closing [e (create (fn [k c] (throw (ex-info "Boom!!" {})))
+  (go-test (closing [e (create (fn [k] (throw (ex-info "Boom!!" {})))
                                :backoffs nil)
                      =metrics (summarize-events e)]
              (async/take! e (fn [& _])) ; no-op take triggers acquisition
@@ -129,43 +130,23 @@
                (is (= 1 acquisition-exception))
                (is (instance? ExceptionInfo last-acquisition-exception))))))
 
-(deftest exceptions-supplying-value-are-caught-and-retried
+(deftest failed-acquisitions-are-retried
   (go-test (closing [e (create (let [state (atom -4)] ; fail three times and then supply a value
-                                 (fn [k c]
-                                   (if (neg? (swap! state inc))
-                                     (throw (ex-info "Boom" {}))
-                                     (async/put! c [@state 100]))))
+                                 (fn [k]
+                                   (async/go (when-not (neg? (swap! state inc))
+                                               [@state 100]))))
                                :vf first)
                      =metrics (summarize-events e)]
              (is (zero? (async/<! e)))
              (async/<! (async/timeout 100))
              (async/close! e)
-             (let [{::uat/keys [acquisition acquisition-exception last-acquisition-exception]
+             (let [{::uat/keys [acquisition failed-acquisition]
                     ::insist/keys [current-backoff backoff-accumulated total-backoff-accumulated] :as m} (async/<! =metrics)]
                (is (nil? current-backoff))
                (is (nil? backoff-accumulated))
                (is (= (+ 1 2 4) total-backoff-accumulated))
                (is (= 1 acquisition))
-               (is (= 3 acquisition-exception))
-               (is (instance? ExceptionInfo last-acquisition-exception))))))
-
-(deftest closed-channel-signal-failure-and-are-retried
-  (go-test (closing [e (create (let [state (atom -4)] ; fail three times and then supply a value
-                                 (fn [k c]
-                                   (if (neg? (swap! state inc))
-                                     (async/close! c)
-                                     (async/put! c [@state 100]))))
-                               :vf first)
-                     =metrics (summarize-events e)]
-             (is (zero? (async/<! e)))
-             (async/<! (async/timeout 100))
-             (async/close! e)
-             (let [{::uat/keys [acquisition acquisition-exception]
-                    ::insist/keys [current-backoff backoff-accumulated total-backoff-accumulated] :as m} (async/<! =metrics)]
-               (is (nil? current-backoff))
-               (is (nil? backoff-accumulated))
-               (is (= (+ 1 2 4) total-backoff-accumulated))
-               (is (= 1 acquisition))))))
+               (is (= 3 failed-acquisition))))))
 
 (deftest pending-async-captures-are-released-when-source-closes
   (go-test (closing [e (create (lazy-producer 10000) :initk -1 :rf nil)]
